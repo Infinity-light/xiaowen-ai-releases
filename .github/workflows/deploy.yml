@@ -66,6 +66,22 @@ jobs:
           DB_PASSWORD=ci-placeholder NEO4J_PASSWORD=ci-placeholder docker compose config --quiet
           rm -f .env
 
+      - name: Reclaim scoped deployment workspace
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
+            "$SERVER_USER@$SERVER_HOST" \
+            'rm -f /tmp/xiaowen-ai-*.tgz /tmp/xiaowen-images-*.tgz /tmp/xiaowen-oss-*.env && docker image prune -f'
+
       - name: Build release images
         shell: bash
         run: |
@@ -204,9 +220,8 @@ jobs:
             test "$(docker inspect "$container_id" --format '{{.RestartCount}}')" = 0
           done
           health_payload=$(curl -fsS http://127.0.0.1:8100/api/health)
-          echo "$health_payload" | grep -q '"status":"ok"'
-          echo "$health_payload" | grep -q '"neo4j":{"status":"ok"'
-          echo "$health_payload" | grep -q '"redis":{"status":"ok"'
+          echo "$health_payload" | jq -e \
+            '.status == "ok" and .graph.status == "ok" and .queue.status == "ok"' >/dev/null
 
           rm -f \
             "/tmp/xiaowen-ai-${SOURCE_SHA}.tgz" \
