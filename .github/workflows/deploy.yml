@@ -2,7 +2,7 @@ name: Deploy Xiaowen AI
 
 on:
   repository_dispatch:
-    types: [deploy]
+    types: [deploy, release]
   workflow_dispatch:
     inputs:
       ref:
@@ -43,6 +43,29 @@ jobs:
           ref: ${{ steps.source.outputs.ref }}
           token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+            admin-web/package-lock.json
+
+      - name: Verify production dependencies and builds
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package in backend frontend admin-web; do
+            (cd "$package" && npm ci && npm audit --omit=dev --audit-level=moderate --registry=https://registry.npmjs.org)
+          done
+          (cd backend && npm run build && npm test)
+          (cd frontend && npm run type-check && npm run test:routing && npm run build:mp-weixin)
+          (cd admin-web && npm run typecheck && npm run build)
+          cp .env.example .env
+          DB_PASSWORD=ci-placeholder NEO4J_PASSWORD=ci-placeholder docker compose config --quiet
+          rm -f .env
+
       - name: Build release images
         shell: bash
         run: |
@@ -53,11 +76,15 @@ jobs:
           docker tag xiaowen-ai-backend:latest xiaowen-ai-seed:latest
           docker build -t xiaowen-ai-frontend:latest frontend
           docker build -t xiaowen-ai-admin-web:latest admin-web
+          docker pull redis:7.4-alpine
+          docker pull neo4j:5.26.12-community
           docker save \
             xiaowen-ai-backend:latest \
             xiaowen-ai-seed:latest \
             xiaowen-ai-frontend:latest \
-            xiaowen-ai-admin-web:latest | gzip -1 > /tmp/xiaowen-images.tgz
+            xiaowen-ai-admin-web:latest \
+            redis:7.4-alpine \
+            neo4j:5.26.12-community | gzip -1 > /tmp/xiaowen-images.tgz
 
       - name: Upload and deploy
         env:
@@ -68,12 +95,18 @@ jobs:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           XIAOWEN_OSS_ACCESS_KEY_ID: ${{ secrets.XIAOWEN_OSS_ACCESS_KEY_ID }}
           XIAOWEN_OSS_ACCESS_KEY_SECRET: ${{ secrets.XIAOWEN_OSS_ACCESS_KEY_SECRET }}
+          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+          NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
         shell: bash
         run: |
           set -euo pipefail
           test -n "$SOURCE_SHA"
           test -n "$XIAOWEN_OSS_ACCESS_KEY_ID"
           test -n "$XIAOWEN_OSS_ACCESS_KEY_SECRET"
+          test -n "$ARK_API_KEY"
+          test -n "$REDIS_PASSWORD"
+          test -n "$NEO4J_PASSWORD"
 
           install -m 700 -d ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
@@ -85,6 +118,12 @@ jobs:
             printf 'XIAOWEN_OSS_ACCESS_KEY_SECRET=%s\n' "$XIAOWEN_OSS_ACCESS_KEY_SECRET"
             printf 'OSS_BUCKET=clouddreamai\n'
             printf 'OSS_REGION=oss-cn-shanghai\n'
+            printf 'ARK_API_KEY=%s\n' "$ARK_API_KEY"
+            printf 'REDIS_PASSWORD=%s\n' "$REDIS_PASSWORD"
+            printf 'NEO4J_USER=neo4j\n'
+            printf 'NEO4J_PASSWORD=%s\n' "$NEO4J_PASSWORD"
+            printf 'NEO4J_DATABASE=neo4j\n'
+            printf 'GRAPH_INDEX_VERSION=graphrag-v1\n'
           } > "$oss_env"
           chmod 600 "$oss_env"
 
@@ -117,6 +156,12 @@ jobs:
             -e '/^XIAOWEN_OSS_ACCESS_KEY_SECRET=/d' \
             -e '/^OSS_BUCKET=/d' \
             -e '/^OSS_REGION=/d' \
+            -e '/^ARK_API_KEY=/d' \
+            -e '/^REDIS_PASSWORD=/d' \
+            -e '/^NEO4J_USER=/d' \
+            -e '/^NEO4J_PASSWORD=/d' \
+            -e '/^NEO4J_DATABASE=/d' \
+            -e '/^GRAPH_INDEX_VERSION=/d' \
             "$release/.env"
           cat "/tmp/xiaowen-oss-${SOURCE_SHA}.env" >> "$release/.env"
 
@@ -153,12 +198,15 @@ jobs:
           done
 
           sleep 60
-          for service in backend frontend admin-web; do
+          for service in postgres redis neo4j backend frontend admin-web; do
             container_id=$(docker compose -p xiaowen-ai ps -q "$service")
             test -n "$container_id"
             test "$(docker inspect "$container_id" --format '{{.RestartCount}}')" = 0
           done
-          curl -fsS http://127.0.0.1:8100/api/health | grep -q '"status":"ok"'
+          health_payload=$(curl -fsS http://127.0.0.1:8100/api/health)
+          echo "$health_payload" | grep -q '"status":"ok"'
+          echo "$health_payload" | grep -q '"neo4j":{"status":"ok"'
+          echo "$health_payload" | grep -q '"redis":{"status":"ok"'
 
           rm -f \
             "/tmp/xiaowen-ai-${SOURCE_SHA}.tgz" \

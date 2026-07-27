@@ -1,0 +1,208 @@
+name: Configure DNS and HTTPS
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 1,15 * *'
+
+concurrency:
+  group: xiaowen-ai-infrastructure
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  dns:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Configure Aliyun DNS
+        env:
+          ALIYUN_DNS_ACCESS_KEY_ID: ${{ secrets.ALIYUN_DNS_ACCESS_KEY_ID }}
+          ALIYUN_DNS_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_DNS_ACCESS_KEY_SECRET }}
+        run: |
+          python -m pip install --quiet alibabacloud_alidns20150109
+          python - <<'PY'
+          import os
+          from alibabacloud_alidns20150109.client import Client
+          from alibabacloud_alidns20150109.models import DescribeDomainRecordsRequest, AddDomainRecordRequest, UpdateDomainRecordRequest
+          from alibabacloud_tea_openapi.models import Config
+
+          domain = 'cytopia.cn'
+          rr = 'xiaowen'
+          target = '47.98.171.82'
+          client = Client(Config(
+              access_key_id=os.environ['ALIYUN_DNS_ACCESS_KEY_ID'],
+              access_key_secret=os.environ['ALIYUN_DNS_ACCESS_KEY_SECRET'],
+              endpoint='alidns.cn-hangzhou.aliyuncs.com',
+          ))
+          response = client.describe_domain_records(DescribeDomainRecordsRequest(
+              domain_name=domain,
+              rrkey_word=rr,
+              type='A',
+          ))
+          records = [record for record in (response.body.domain_records.record or []) if record.rr == rr and record.type == 'A']
+          if not records:
+              client.add_domain_record(AddDomainRecordRequest(domain_name=domain, rr=rr, type='A', value=target))
+              print(f'created {rr}.{domain} -> {target}')
+          elif records[0].value != target:
+              client.update_domain_record(UpdateDomainRecordRequest(record_id=records[0].record_id, rr=rr, type='A', value=target))
+              print(f'updated {rr}.{domain} -> {target}')
+          else:
+              print(f'verified {rr}.{domain} -> {target}')
+          PY
+
+  https:
+    needs: dns
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$SERVER_PORT" -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+      - name: Check certificate renewal requirement
+        id: certificate
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          if ssh -p "$SERVER_PORT" -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" \
+            "test -f /etc/letsencrypt/live/xiaowen.cytopia.cn/fullchain.pem && openssl x509 -checkend 2592000 -noout -in /etc/letsencrypt/live/xiaowen.cytopia.cn/fullchain.pem"; then
+            echo 'renew=false' >> "$GITHUB_OUTPUT"
+            echo 'Existing certificate remains valid for more than 30 days'
+          else
+            echo 'renew=true' >> "$GITHUB_OUTPUT"
+            echo 'Certificate is missing or expires within 30 days'
+          fi
+      - name: Issue certificate with Aliyun DNS challenge
+        if: steps.certificate.outputs.renew == 'true'
+        env:
+          Ali_Key: ${{ secrets.ALIYUN_DNS_ACCESS_KEY_ID }}
+          Ali_Secret: ${{ secrets.ALIYUN_DNS_ACCESS_KEY_SECRET }}
+        run: |
+          curl -fsSL https://get.acme.sh | sh -s email=ops@cytopia.cn
+          ~/.acme.sh/acme.sh --issue --dns dns_ali -d xiaowen.cytopia.cn --server letsencrypt --keylength ec-256
+          ~/.acme.sh/acme.sh --install-cert --ecc -d xiaowen.cytopia.cn \
+            --key-file /tmp/xiaowen-privkey.pem \
+            --fullchain-file /tmp/xiaowen-fullchain.pem
+      - name: Upload certificate
+        if: steps.certificate.outputs.renew == 'true'
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          scp -P "$SERVER_PORT" -i ~/.ssh/deploy_key /tmp/xiaowen-privkey.pem /tmp/xiaowen-fullchain.pem "$SERVER_USER@$SERVER_HOST:/tmp/"
+      - name: Configure Nginx and Let's Encrypt
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          ssh -p "$SERVER_PORT" -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            resolved=$(getent ahostsv4 xiaowen.cytopia.cn | awk 'NR==1 {print $1}')
+            [ "$resolved" = '47.98.171.82' ] && break
+            [ "$attempt" = 10 ] && { echo "DNS did not resolve to the target server"; exit 1; }
+            sleep 15
+          done
+          command -v nginx >/dev/null
+          sudo mkdir -p /etc/letsencrypt/live/xiaowen.cytopia.cn
+          if [ -f /tmp/xiaowen-privkey.pem ] && [ -f /tmp/xiaowen-fullchain.pem ]; then
+            sudo install -m 600 /tmp/xiaowen-privkey.pem /etc/letsencrypt/live/xiaowen.cytopia.cn/privkey.pem
+            sudo install -m 644 /tmp/xiaowen-fullchain.pem /etc/letsencrypt/live/xiaowen.cytopia.cn/fullchain.pem
+            sudo rm -f /tmp/xiaowen-privkey.pem /tmp/xiaowen-fullchain.pem
+          fi
+          sudo tee /etc/nginx/sites-available/xiaowen-cytopia.conf >/dev/null <<'NGINX'
+          server {
+              listen 80;
+              listen [::]:80;
+              server_name xiaowen.cytopia.cn;
+
+              location / {
+                  return 301 https://$host$request_uri;
+              }
+          }
+
+          server {
+              listen 443 ssl http2;
+              listen [::]:443 ssl http2;
+              server_name xiaowen.cytopia.cn;
+
+              ssl_certificate /etc/letsencrypt/live/xiaowen.cytopia.cn/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/xiaowen.cytopia.cn/privkey.pem;
+
+              location / {
+                  proxy_pass http://127.0.0.1:8100;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 180s;
+                  proxy_send_timeout 180s;
+              }
+          }
+          NGINX
+          sudo ln -sfn /etc/nginx/sites-available/xiaowen-cytopia.conf /etc/nginx/sites-enabled/xiaowen-cytopia.conf
+          sudo nginx -t
+          sudo systemctl reload nginx
+          curl --noproxy '*' --resolve xiaowen.cytopia.cn:443:127.0.0.1 -fsS https://xiaowen.cytopia.cn/api/health | grep -q '"status":"ok"'
+          REMOTE
+
+  wechat-domain:
+    needs: dns
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure mini program legal domains
+        env:
+          WX_APP_ID: ${{ secrets.WX_APP_ID }}
+          WX_APP_SECRET: ${{ secrets.WX_APP_SECRET }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          token_query = urllib.parse.urlencode({
+              'grant_type': 'client_credential',
+              'appid': os.environ['WX_APP_ID'],
+              'secret': os.environ['WX_APP_SECRET'],
+          })
+          with urllib.request.urlopen(f'https://api.weixin.qq.com/cgi-bin/token?{token_query}', timeout=20) as response:
+              token_payload = json.load(response)
+          access_token = token_payload.get('access_token')
+          if not access_token:
+              raise RuntimeError(f"WeChat token request failed: {token_payload.get('errcode')} {token_payload.get('errmsg')}")
+
+          domain = 'https://xiaowen.cytopia.cn'
+          body = json.dumps({
+              'action': 'add',
+              'requestdomain': [domain],
+              'uploaddomain': [domain],
+              'downloaddomain': [domain],
+          }).encode('utf-8')
+          request = urllib.request.Request(
+              f'https://api.weixin.qq.com/wxa/modify_domain?access_token={access_token}',
+              data=body,
+              headers={'Content-Type': 'application/json'},
+              method='POST',
+          )
+          with urllib.request.urlopen(request, timeout=20) as response:
+              result = json.load(response)
+          if result.get('errcode') not in (0, None):
+              raise RuntimeError(f"WeChat domain update failed: {result.get('errcode')} {result.get('errmsg')}")
+          print('WeChat request/upload/download legal domains configured')
+          PY
