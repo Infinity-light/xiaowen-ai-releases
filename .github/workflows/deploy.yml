@@ -1,0 +1,139 @@
+name: Deploy Monorepo
+
+on:
+  repository_dispatch:
+    types: [deploy]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Commit SHA to deploy'
+        required: true
+      repo:
+        description: 'Source repo (owner/name)'
+        required: true
+
+concurrency:
+  group: deploy-xiaowen-ai
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Linux, X64]
+    permissions:
+      contents: read
+    timeout-minutes: 25
+
+    steps:
+      - name: Resolve inputs
+        id: inputs
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "ref=${{ github.event.client_payload.ref }}" >> $GITHUB_OUTPUT
+            echo "repo=${{ github.event.client_payload.repo }}" >> $GITHUB_OUTPUT
+          else
+            echo "ref=${{ github.event.inputs.ref }}" >> $GITHUB_OUTPUT
+            echo "repo=${{ github.event.inputs.repo }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.inputs.outputs.repo }}
+          ref: ${{ steps.inputs.outputs.ref }}
+          token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
+
+      - name: Sync source to deploy dir
+        run: |
+          mkdir -p /opt/apps/xiaowen-ai
+          rsync -a --exclude='.git' --exclude='node_modules' --exclude='_work' \
+            ./ /opt/apps/xiaowen-ai/
+
+      - name: Build apps on host
+        run: |
+          cd /opt/apps/xiaowen-ai
+          pnpm install --frozen-lockfile
+
+          pnpm --filter server build
+
+
+
+      - name: Build and deploy
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          WX_APP_ID: ${{ secrets.WX_APP_ID }}
+          WX_APP_SECRET: ${{ secrets.WX_APP_SECRET }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DOUBAO_VOICE_KEY: ${{ secrets.DOUBAO_VOICE_KEY }}
+          SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+          XIAOWEN_OSS_ACCESS_KEY_ID: ${{ secrets.XIAOWEN_OSS_ACCESS_KEY_ID }}
+          XIAOWEN_OSS_ACCESS_KEY_SECRET: ${{ secrets.XIAOWEN_OSS_ACCESS_KEY_SECRET }}
+          ALIYUN_DNS_ACCESS_KEY_ID: ${{ secrets.ALIYUN_DNS_ACCESS_KEY_ID }}
+          ALIYUN_DNS_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_DNS_ACCESS_KEY_SECRET }}
+        run: |
+          set -e
+          cd /opt/apps/xiaowen-ai
+
+          echo "=== Writing .env ==="
+          : > .env
+          cat > .env << 'ENVEOF'
+          NODE_ENV=staging
+          WEB_PORT=8100
+          JWT_EXPIRES_IN=30d
+          WX_MOCK_MODE=false
+          WX_AUTO_PROVISION=true
+          DEEPSEEK_MODEL=deepseek-v4-pro
+          VOLCENGINE_ASR_API_KEY=${DOUBAO_VOICE_KEY}
+          VOLCENGINE_ASR_RESOURCE_ID=volc.seedasr.auc
+          VOLCENGINE_ASR_SUBMIT_URL=https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit
+          VOLCENGINE_ASR_QUERY_URL=https://openspeech.bytedance.com/api/v3/auc/bigmodel/query
+          PORT=3000
+          UPLOAD_DIR=/app/uploads
+          DEEPSEEK_BASE_URL=https://api.deepseek.com
+          SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
+          OSS_REGION=oss-cn-shanghai
+          OSS_BUCKET=clouddreamai
+          ENVEOF
+          sed -i 's/^ *//' .env
+          printf '%s=%s\n' 'DB_PASSWORD' "${DB_PASSWORD}" >> .env
+          printf '%s=%s\n' 'JWT_SECRET' "${JWT_SECRET}" >> .env
+          printf '%s=%s\n' 'WX_APP_ID' "${WX_APP_ID}" >> .env
+          printf '%s=%s\n' 'WX_APP_SECRET' "${WX_APP_SECRET}" >> .env
+          printf '%s=%s\n' 'DEEPSEEK_API_KEY' "${DEEPSEEK_API_KEY}" >> .env
+          printf '%s=%s\n' 'DOUBAO_VOICE_KEY' "${DOUBAO_VOICE_KEY}" >> .env
+          printf '%s=%s\n' 'SILICONFLOW_API_KEY' "${SILICONFLOW_API_KEY}" >> .env
+          printf '%s=%s\n' 'XIAOWEN_OSS_ACCESS_KEY_ID' "${XIAOWEN_OSS_ACCESS_KEY_ID}" >> .env
+          printf '%s=%s\n' 'XIAOWEN_OSS_ACCESS_KEY_SECRET' "${XIAOWEN_OSS_ACCESS_KEY_SECRET}" >> .env
+          printf '%s=%s\n' 'ALIYUN_DNS_ACCESS_KEY_ID' "${ALIYUN_DNS_ACCESS_KEY_ID}" >> .env
+          printf '%s=%s\n' 'ALIYUN_DNS_ACCESS_KEY_SECRET' "${ALIYUN_DNS_ACCESS_KEY_SECRET}" >> .env
+
+          echo "=== Building images ==="
+          docker compose -f docker-compose.prod.yml build
+
+          echo "=== Starting containers ==="
+          docker compose -f docker-compose.prod.yml up -d --remove-orphans
+
+
+
+          echo "=== Cleanup ==="
+          docker image prune -f
+
+
+
+      - name: Health check
+        run: |
+          echo "Waiting for containers to start..."
+          sleep 10
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8100/ || true)
+            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 400 ]; then
+              echo "Health check passed (HTTP $STATUS)"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $STATUS, retrying in 5s..."
+            sleep 5
+          done
+          echo "Health check failed after 5 attempts"
+          docker ps --filter name=xiaowen-ai
+          docker logs xiaowen-ai-server-1 --tail 30 2>/dev/null || true
+          exit 1
