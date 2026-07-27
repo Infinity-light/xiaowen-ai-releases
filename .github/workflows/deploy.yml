@@ -162,8 +162,12 @@ jobs:
           tar -xzf "/tmp/xiaowen-ai-${SOURCE_SHA}.tgz" -C "$release"
           gzip -dc "/tmp/xiaowen-images-${SOURCE_SHA}.tgz" | docker load
 
-          if [ -n "$previous_release" ] && [ -f "$previous_release/.env" ]; then
+          if [ -n "$previous_release" ] \
+            && [ "$previous_release" != "$release" ] \
+            && [ -f "$previous_release/.env" ]; then
             install -m 600 "$previous_release/.env" "$release/.env"
+          elif [ -f "$release/.env" ]; then
+            chmod 600 "$release/.env"
           else
             install -m 600 "/tmp/xiaowen-oss-${SOURCE_SHA}.env" "$release/.env"
           fi
