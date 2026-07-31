@@ -1,0 +1,214 @@
+name: WeChat Mini Program Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Operation to execute
+        required: true
+        default: inspect
+        type: choice
+        options:
+          - inspect
+          - submit
+          - status
+      page_address:
+        description: Main page submitted for review
+        required: true
+        default: pages/ask/index
+        type: string
+      page_title:
+        description: Page title shown to reviewers
+        required: true
+        default: 销问AI
+        type: string
+      page_tags:
+        description: Space-separated review tags
+        required: true
+        default: 销售助手 企业知识库 人工智能
+        type: string
+      category_first:
+        description: Optional exact first-level category
+        required: false
+        type: string
+      category_second:
+        description: Optional exact second-level category
+        required: false
+        type: string
+      category_third:
+        description: Optional exact third-level category
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wechat-mini-program-review
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      WX_APP_ID: ${{ secrets.WX_APP_ID }}
+      WX_APP_SECRET: ${{ secrets.WX_APP_SECRET }}
+      OPERATION: ${{ inputs.operation }}
+      PAGE_ADDRESS: ${{ inputs.page_address }}
+      PAGE_TITLE: ${{ inputs.page_title }}
+      PAGE_TAGS: ${{ inputs.page_tags }}
+      CATEGORY_FIRST: ${{ inputs.category_first }}
+      CATEGORY_SECOND: ${{ inputs.category_second }}
+      CATEGORY_THIRD: ${{ inputs.category_third }}
+    steps:
+      - name: Inspect or submit the uploaded mini program
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs')
+
+          const required = (name) => {
+            const value = (process.env[name] || '').trim()
+            if (!value) throw new Error(`${name} is not configured`)
+            return value
+          }
+
+          const appId = required('WX_APP_ID')
+          const appSecret = required('WX_APP_SECRET')
+          const operation = required('OPERATION')
+
+          const redact = (value) => {
+            if (!value || typeof value !== 'object') return value
+            const clone = JSON.parse(JSON.stringify(value))
+            delete clone.access_token
+            return clone
+          }
+
+          const failOnWechatError = (label, payload, allowed = []) => {
+            const code = Number(payload?.errcode || 0)
+            if (code && !allowed.includes(code)) {
+              throw new Error(`${label} failed: ${JSON.stringify(redact(payload))}`)
+            }
+            return payload
+          }
+
+          const request = async (url, init) => {
+            const response = await fetch(url, init)
+            const text = await response.text()
+            let payload
+            try {
+              payload = JSON.parse(text)
+            } catch {
+              throw new Error(`WeChat returned non-JSON HTTP ${response.status}`)
+            }
+            if (!response.ok) {
+              throw new Error(`WeChat returned HTTP ${response.status}: ${JSON.stringify(redact(payload))}`)
+            }
+            return payload
+          }
+
+          const tokenPayload = await request(
+            `https://api.weixin.qq.com/cgi-bin/token?grant_type=client_credential&appid=${encodeURIComponent(appId)}&secret=${encodeURIComponent(appSecret)}`,
+          )
+          failOnWechatError('access token', tokenPayload)
+          const accessToken = tokenPayload.access_token
+          if (!accessToken) throw new Error('WeChat access token is missing')
+
+          const api = async (path, body) => {
+            const url = `https://api.weixin.qq.com/${path}?access_token=${encodeURIComponent(accessToken)}`
+            const init = body === undefined
+              ? undefined
+              : {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify(body),
+                }
+            return request(url, init)
+          }
+
+          const summary = []
+          const addSummary = (heading, payload) => {
+            summary.push(`## ${heading}`)
+            summary.push('```json')
+            summary.push(JSON.stringify(redact(payload), null, 2))
+            summary.push('```')
+          }
+
+          if (operation === 'status') {
+            const latest = await api('wxa/get_latest_audit_status')
+            failOnWechatError('latest audit status', latest)
+            addSummary('Latest audit status', latest)
+          } else {
+            const [pages, categories, version] = await Promise.all([
+              api('wxa/get_page'),
+              api('wxa/get_category'),
+              api('wxa/getversioninfo', {}),
+            ])
+            failOnWechatError('uploaded pages', pages)
+            failOnWechatError('service categories', categories)
+            failOnWechatError('version information', version)
+            addSummary('Uploaded pages', pages)
+            addSummary('Service categories', categories)
+            addSummary('Version information', version)
+
+            if (operation === 'submit') {
+              const address = required('PAGE_ADDRESS')
+              const title = required('PAGE_TITLE')
+              const tag = required('PAGE_TAGS')
+              const pageList = Array.isArray(pages.page_list) ? pages.page_list : []
+              if (!pageList.includes(address)) {
+                throw new Error(`PAGE_ADDRESS is not present in the uploaded package: ${address}`)
+              }
+
+              const categoryList = Array.isArray(categories.category_list) ? categories.category_list : []
+              const requested = {
+                first: (process.env.CATEGORY_FIRST || '').trim(),
+                second: (process.env.CATEGORY_SECOND || '').trim(),
+                third: (process.env.CATEGORY_THIRD || '').trim(),
+              }
+              let category
+              if (requested.first || requested.second || requested.third) {
+                category = categoryList.find((item) =>
+                  (!requested.first || item.first_class === requested.first) &&
+                  (!requested.second || item.second_class === requested.second) &&
+                  (!requested.third || item.third_class === requested.third),
+                )
+              } else {
+                const priorities = ['办公', '效率', '企业管理', '工具']
+                category = categoryList.find((item) =>
+                  priorities.some((keyword) =>
+                    [item.first_class, item.second_class, item.third_class]
+                      .filter(Boolean)
+                      .some((value) => String(value).includes(keyword)),
+                  ),
+                ) || categoryList[0]
+              }
+              if (!category) {
+                throw new Error(`No authorized service category matches: ${JSON.stringify(requested)}`)
+              }
+
+              const item = {
+                address,
+                tag,
+                title,
+                first_class: category.first_class,
+                second_class: category.second_class,
+                first_id: category.first_id,
+                second_id: category.second_id,
+              }
+              if (category.third_class) item.third_class = category.third_class
+              if (category.third_id) item.third_id = category.third_id
+
+              const submitted = await api('wxa/submit_audit', {
+                item_list: [item],
+                version_desc: '预设问题卡片固定等宽，高度随内容紧凑自适应',
+              })
+              failOnWechatError('submit audit', submitted)
+              addSummary('Submitted audit', { ...submitted, item })
+            }
+          }
+
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${summary.join('\n')}\n`)
+          console.log(`WeChat ${operation} completed successfully`)
+          NODE
