@@ -52,8 +52,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      WX_APP_ID: ${{ secrets.WX_APP_ID }}
-      WX_APP_SECRET: ${{ secrets.WX_APP_SECRET }}
+      SERVER_HOST: ${{ secrets.SERVER_HOST }}
+      SERVER_USER: ${{ secrets.SERVER_USER }}
+      SERVER_PORT: ${{ secrets.SERVER_PORT }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
       OPERATION: ${{ inputs.operation }}
       PAGE_ADDRESS: ${{ inputs.page_address }}
       PAGE_TITLE: ${{ inputs.page_title }}
@@ -65,8 +67,30 @@ jobs:
       - name: Inspect or submit the uploaded mini program
         shell: bash
         run: |
-          node <<'NODE'
-          const { appendFileSync } = await import('node:fs')
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/wechat_review_key
+          chmod 600 ~/.ssh/wechat_review_key
+
+          printf -v operation_q '%q' "$OPERATION"
+          printf -v page_address_q '%q' "$PAGE_ADDRESS"
+          printf -v page_title_q '%q' "$PAGE_TITLE"
+          printf -v page_tags_q '%q' "$PAGE_TAGS"
+          printf -v category_first_q '%q' "$CATEGORY_FIRST"
+          printf -v category_second_q '%q' "$CATEGORY_SECOND"
+          printf -v category_third_q '%q' "$CATEGORY_THIRD"
+
+          ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/wechat_review_key \
+            "$SERVER_USER@$SERVER_HOST" \
+            "cd /opt/apps/xiaowen-ai/current && docker compose -p xiaowen-ai exec -T \
+              -e OPERATION=$operation_q \
+              -e PAGE_ADDRESS=$page_address_q \
+              -e PAGE_TITLE=$page_title_q \
+              -e PAGE_TAGS=$page_tags_q \
+              -e CATEGORY_FIRST=$category_first_q \
+              -e CATEGORY_SECOND=$category_second_q \
+              -e CATEGORY_THIRD=$category_third_q \
+              backend node -" <<'NODE'
 
           const required = (name) => {
             const value = (process.env[name] || '').trim()
@@ -209,6 +233,6 @@ jobs:
             }
           }
 
-          appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${summary.join('\n')}\n`)
+          console.log(summary.join('\n'))
           console.log(`WeChat ${operation} completed successfully`)
           NODE
