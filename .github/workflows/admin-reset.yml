@@ -121,6 +121,56 @@ jobs:
               throw new Error('in-container login returned an invalid payload');
             }
             console.log('superadmin login verified against the production backend container');
+
+            const api = async (path, init = {}) => {
+              const headers = new Headers(init.headers || {});
+              headers.set('authorization', `Bearer ${payload.token}`);
+              if (init.body) headers.set('content-type', 'application/json');
+              const apiResponse = await fetch(`http://127.0.0.1:3000${path}`, { ...init, headers });
+              const apiPayload = await apiResponse.json().catch(() => ({}));
+              if (!apiResponse.ok) {
+                throw new Error(`${init.method || 'GET'} ${path} failed: HTTP ${apiResponse.status} ${JSON.stringify(apiPayload)}`);
+              }
+              return apiPayload;
+            };
+
+            const enterprises = await api('/api/admin/enterprises?page=1&pageSize=100');
+            const active = (enterprises.items || []).filter((item) => item.status === 'active');
+            const preferred = active.filter((item) => /天禹|销问|熵舟/.test(item.name));
+            const targets = preferred.length ? preferred : active.length === 1 ? active : [];
+            if (!targets.length) {
+              throw new Error(`unable to select the target enterprise safely; active count=${active.length}`);
+            }
+
+            const boostingTableId = '7a204022-7d22-4986-8c2a-b290841bf830';
+            const desiredHotwords = [
+              { word: '天禹', weight: 10, aliases: [] },
+              { word: '天禹数智', weight: 10, aliases: [] },
+            ];
+            for (const enterprise of targets) {
+              const enterpriseId = encodeURIComponent(enterprise.id);
+              await api(`/api/admin/asr-hotwords/config?enterpriseId=${enterpriseId}`, {
+                method: 'PUT',
+                body: JSON.stringify({ boostingTableId }),
+              });
+              const current = await api(`/api/admin/asr-hotwords?enterpriseId=${enterpriseId}`);
+              for (const desired of desiredHotwords) {
+                const existing = (current.items || []).find((item) => item.word === desired.word);
+                await api(existing
+                  ? `/api/admin/asr-hotwords/${encodeURIComponent(existing.id)}?enterpriseId=${enterpriseId}`
+                  : `/api/admin/asr-hotwords?enterpriseId=${enterpriseId}`, {
+                  method: existing ? 'PUT' : 'POST',
+                  body: JSON.stringify(desired),
+                });
+              }
+              const verified = await api(`/api/admin/asr-hotwords?enterpriseId=${enterpriseId}`);
+              const verifiedWords = new Map((verified.items || []).map((item) => [item.word, item]));
+              if (verified.boostingTableId !== boostingTableId
+                || desiredHotwords.some((item) => verifiedWords.get(item.word)?.weight !== 10)) {
+                throw new Error(`hotword verification failed for enterprise ${enterprise.name}`);
+              }
+              console.log(`ASR hotwords verified for enterprise: ${enterprise.name}`);
+            }
           })().catch((error) => {
             console.error(error instanceof Error ? error.message : String(error));
             process.exit(1);
@@ -152,27 +202,18 @@ jobs:
           echo "superadmin reset complete; rollback backup retained at $backup_file"
           REMOTE
 
-      - name: Verify reset credentials
-        env:
-          ADMIN_RESET_PASSWORD: ${{ secrets.ADMIN_RESET_PASSWORD }}
+      - name: Verify public service health
         run: |
           set -euo pipefail
           node <<'NODE'
           (async () => {
-            const response = await fetch('https://xiaowen.cytopia.cn/api/admin/auth/login', {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({
-                username: 'superadmin',
-                password: process.env.ADMIN_RESET_PASSWORD,
-              }),
-            });
-            if (!response.ok) throw new Error(`admin login verification failed: HTTP ${response.status}`);
+            const response = await fetch('https://xiaowen.cytopia.cn/api/health');
+            if (!response.ok) throw new Error(`public health verification failed: HTTP ${response.status}`);
             const payload = await response.json();
-            if (payload?.admin?.username !== 'superadmin' || !payload?.token) {
-              throw new Error('admin login verification returned an invalid payload');
+            if (payload?.status !== 'ok' || payload?.database !== 'ok') {
+              throw new Error('public health verification returned an invalid payload');
             }
-            console.log('superadmin login verified');
+            console.log('public service health verified');
           })().catch((error) => {
             console.error(error.message);
             process.exit(1);
