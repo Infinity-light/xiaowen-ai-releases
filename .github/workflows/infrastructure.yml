@@ -140,6 +140,8 @@ jobs:
               listen [::]:443 ssl;
               server_name xiaowen.cytopia.cn;
 
+              client_max_body_size 64m;
+
               ssl_certificate /etc/letsencrypt/live/xiaowen.cytopia.cn/fullchain.pem;
               ssl_certificate_key /etc/letsencrypt/live/xiaowen.cytopia.cn/privkey.pem;
 
