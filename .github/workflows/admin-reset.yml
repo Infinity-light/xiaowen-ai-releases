@@ -104,6 +104,28 @@ jobs:
             process.exit(1);
           });
           NODE
+          docker compose -p xiaowen-ai exec -T \
+            -e ADMIN_PASSWORD_B64="$ADMIN_PASSWORD_B64" backend node - <<'NODE'
+          (async () => {
+            const password = Buffer.from(process.env.ADMIN_PASSWORD_B64, 'base64').toString('utf8');
+            const response = await fetch('http://127.0.0.1:3000/api/admin/auth/login', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ username: 'superadmin', password }),
+            });
+            if (!response.ok) {
+              throw new Error(`in-container login failed: HTTP ${response.status} ${await response.text()}`);
+            }
+            const payload = await response.json();
+            if (payload?.admin?.username !== 'superadmin' || !payload?.token) {
+              throw new Error('in-container login returned an invalid payload');
+            }
+            console.log('superadmin login verified against the production backend container');
+          })().catch((error) => {
+            console.error(error instanceof Error ? error.message : String(error));
+            process.exit(1);
+          });
+          NODE
           unset ADMIN_PASSWORD_B64
           echo "superadmin reset complete; rollback backup retained at $backup_file"
           REMOTE
