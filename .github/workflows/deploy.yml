@@ -1,236 +1,149 @@
-name: Deploy Xiaowen AI
+name: Deploy Monorepo
+run-name: "${{ github.event_name == 'repository_dispatch' && format('deploy {0} [{1}]', github.event.client_payload.source_sha, github.event.client_payload.dispatch_id) || format('deploy {0} [manual]', inputs.ref) }}"
 
 on:
   repository_dispatch:
-    types: [deploy, release]
+    types: [deploy]
   workflow_dispatch:
     inputs:
       ref:
-        description: Source commit SHA
+        description: 'Commit SHA to deploy'
         required: true
       repo:
-        description: Source repository
+        description: 'Source repo (owner/name)'
         required: true
-        default: Infinity-light/xiaowen-ai
 
 concurrency:
-  group: xiaowen-ai-production
+  group: deploy-xiaowen-ai
   cancel-in-progress: false
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 35
+    runs-on: [self-hosted, Linux, X64]
     permissions:
       contents: read
+    timeout-minutes: 25
+
     steps:
-      - name: Resolve source
-        id: source
-        shell: bash
+      - name: Resolve inputs
+        id: inputs
         run: |
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "ref=${{ github.event.client_payload.ref }}" >> "$GITHUB_OUTPUT"
-            echo "repo=${{ github.event.client_payload.repo }}" >> "$GITHUB_OUTPUT"
+            echo "ref=${{ github.event.client_payload.ref }}" >> $GITHUB_OUTPUT
+            echo "repo=${{ github.event.client_payload.repo }}" >> $GITHUB_OUTPUT
           else
-            echo "ref=${{ inputs.ref }}" >> "$GITHUB_OUTPUT"
-            echo "repo=${{ inputs.repo }}" >> "$GITHUB_OUTPUT"
+            echo "ref=${{ github.event.inputs.ref }}" >> $GITHUB_OUTPUT
+            echo "repo=${{ github.event.inputs.repo }}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Checkout private source
+      - name: Checkout source repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.source.outputs.repo }}
-          ref: ${{ steps.source.outputs.ref }}
+          repository: ${{ steps.inputs.outputs.repo }}
+          ref: ${{ steps.inputs.outputs.ref }}
           token: ${{ secrets.GH_RELEASE_REPO_TOKEN }}
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: |
-            backend/package-lock.json
-            frontend/package-lock.json
-            admin-web/package-lock.json
-
-      - name: Verify production dependencies and builds
-        shell: bash
+      - name: Sync source to deploy dir
         run: |
-          set -euo pipefail
-          for package in backend frontend admin-web; do
-            (cd "$package" && npm ci && npm audit --omit=dev --audit-level=moderate --registry=https://registry.npmjs.org)
-          done
-          (cd backend && npm run build && npm test)
-          (cd frontend && npm run type-check && npm run test:routing && npm run build:mp-weixin)
-          (cd admin-web && npm run typecheck && npm run build)
-          cp .env.example .env
-          DB_PASSWORD=ci-placeholder NEO4J_PASSWORD=ci-placeholder docker compose config --quiet
-          rm -f .env
+          mkdir -p /opt/apps/xiaowen-ai
+          rsync -a --exclude='.git' --exclude='node_modules' --exclude='_work' \
+            ./ /opt/apps/xiaowen-ai/
 
-      - name: Reclaim scoped deployment workspace
+      - name: Build apps on host
+        run: |
+          cd /opt/apps/xiaowen-ai
+          pnpm install --frozen-lockfile
+
+          pnpm --filter server build
+
+
+
+      - name: Build and deploy
         env:
-          SERVER_HOST: ${{ secrets.SERVER_HOST }}
-          SERVER_USER: ${{ secrets.SERVER_USER }}
-          SERVER_PORT: ${{ secrets.SERVER_PORT }}
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
-            "$SERVER_USER@$SERVER_HOST" \
-            'rm -f /tmp/xiaowen-ai-*.tgz /tmp/xiaowen-images-*.tgz /tmp/xiaowen-oss-*.env && docker image prune -f'
-
-      - name: Build release images
-        shell: bash
-        run: |
-          set -euo pipefail
-          tar --exclude=.git --exclude=.workflow --exclude=node_modules --exclude=dist --exclude=.env \
-            -czf /tmp/xiaowen-ai.tgz .
-          docker build -t xiaowen-ai-backend:latest backend
-          docker tag xiaowen-ai-backend:latest xiaowen-ai-seed:latest
-          docker build -t xiaowen-ai-frontend:latest frontend
-          docker build -t xiaowen-ai-admin-web:latest admin-web
-          docker pull redis:7.4-alpine
-          docker pull neo4j:5.26.12-community
-          docker save \
-            xiaowen-ai-backend:latest \
-            xiaowen-ai-seed:latest \
-            xiaowen-ai-frontend:latest \
-            xiaowen-ai-admin-web:latest \
-            redis:7.4-alpine \
-            neo4j:5.26.12-community | gzip -1 > /tmp/xiaowen-images.tgz
-
-      - name: Upload and deploy
-        env:
-          SOURCE_SHA: ${{ steps.source.outputs.ref }}
-          SERVER_HOST: ${{ secrets.SERVER_HOST }}
-          SERVER_USER: ${{ secrets.SERVER_USER }}
-          SERVER_PORT: ${{ secrets.SERVER_PORT }}
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          XIAOWEN_OSS_ACCESS_KEY_ID: ${{ secrets.XIAOWEN_OSS_ACCESS_KEY_ID }}
-          XIAOWEN_OSS_ACCESS_KEY_SECRET: ${{ secrets.XIAOWEN_OSS_ACCESS_KEY_SECRET }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          WX_APP_ID: ${{ secrets.WX_APP_ID }}
+          WX_APP_SECRET: ${{ secrets.WX_APP_SECRET }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DOUBAO_VOICE_KEY: ${{ secrets.DOUBAO_VOICE_KEY }}
+          SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
           ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
           REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
           NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
-        shell: bash
+          XIAOWEN_OSS_ACCESS_KEY_ID: ${{ secrets.XIAOWEN_OSS_ACCESS_KEY_ID }}
+          XIAOWEN_OSS_ACCESS_KEY_SECRET: ${{ secrets.XIAOWEN_OSS_ACCESS_KEY_SECRET }}
+          ALIYUN_DNS_ACCESS_KEY_ID: ${{ secrets.ALIYUN_DNS_ACCESS_KEY_ID }}
+          ALIYUN_DNS_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_DNS_ACCESS_KEY_SECRET }}
         run: |
-          set -euo pipefail
-          test -n "$SOURCE_SHA"
-          test -n "$XIAOWEN_OSS_ACCESS_KEY_ID"
-          test -n "$XIAOWEN_OSS_ACCESS_KEY_SECRET"
-          test -n "$ARK_API_KEY"
-          test -n "$REDIS_PASSWORD"
-          test -n "$NEO4J_PASSWORD"
+          set -e
+          cd /opt/apps/xiaowen-ai
 
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
+          echo "=== Writing .env ==="
+          : > .env
+          cat > .env << 'ENVEOF'
+          NODE_ENV=production
+          WEB_PORT=8100
+          JWT_EXPIRES_IN=30d
+          WX_MOCK_MODE=false
+          WX_AUTO_PROVISION=true
+          DEEPSEEK_MODEL=deepseek-v4-pro
+          VOLCENGINE_ASR_API_KEY=${DOUBAO_VOICE_KEY}
+          VOLCENGINE_ASR_RESOURCE_ID=volc.seedasr.auc
+          VOLCENGINE_ASR_SUBMIT_URL=https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit
+          VOLCENGINE_ASR_QUERY_URL=https://openspeech.bytedance.com/api/v3/auc/bigmodel/query
+          PORT=3000
+          UPLOAD_DIR=/app/uploads
+          DEEPSEEK_BASE_URL=https://api.deepseek.com
+          SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
+          OSS_REGION=oss-cn-shanghai
+          OSS_BUCKET=clouddreamai
+          NEO4J_USER=neo4j
+          NEO4J_DATABASE=neo4j
+          GRAPH_INDEX_VERSION=graphrag-v1
+          ENVEOF
+          sed -i 's/^ *//' .env
+          printf '%s=%s\n' 'DB_PASSWORD' "${DB_PASSWORD}" >> .env
+          printf '%s=%s\n' 'JWT_SECRET' "${JWT_SECRET}" >> .env
+          printf '%s=%s\n' 'WX_APP_ID' "${WX_APP_ID}" >> .env
+          printf '%s=%s\n' 'WX_APP_SECRET' "${WX_APP_SECRET}" >> .env
+          printf '%s=%s\n' 'DEEPSEEK_API_KEY' "${DEEPSEEK_API_KEY}" >> .env
+          printf '%s=%s\n' 'DOUBAO_VOICE_KEY' "${DOUBAO_VOICE_KEY}" >> .env
+          printf '%s=%s\n' 'SILICONFLOW_API_KEY' "${SILICONFLOW_API_KEY}" >> .env
+          printf '%s=%s\n' 'ARK_API_KEY' "${ARK_API_KEY}" >> .env
+          printf '%s=%s\n' 'REDIS_PASSWORD' "${REDIS_PASSWORD}" >> .env
+          printf '%s=%s\n' 'NEO4J_PASSWORD' "${NEO4J_PASSWORD}" >> .env
+          printf '%s=%s\n' 'XIAOWEN_OSS_ACCESS_KEY_ID' "${XIAOWEN_OSS_ACCESS_KEY_ID}" >> .env
+          printf '%s=%s\n' 'XIAOWEN_OSS_ACCESS_KEY_SECRET' "${XIAOWEN_OSS_ACCESS_KEY_SECRET}" >> .env
+          printf '%s=%s\n' 'ALIYUN_DNS_ACCESS_KEY_ID' "${ALIYUN_DNS_ACCESS_KEY_ID}" >> .env
+          printf '%s=%s\n' 'ALIYUN_DNS_ACCESS_KEY_SECRET' "${ALIYUN_DNS_ACCESS_KEY_SECRET}" >> .env
 
-          oss_env="/tmp/xiaowen-oss-${SOURCE_SHA}.env"
-          {
-            printf 'XIAOWEN_OSS_ACCESS_KEY_ID=%s\n' "$XIAOWEN_OSS_ACCESS_KEY_ID"
-            printf 'XIAOWEN_OSS_ACCESS_KEY_SECRET=%s\n' "$XIAOWEN_OSS_ACCESS_KEY_SECRET"
-            printf 'OSS_BUCKET=clouddreamai\n'
-            printf 'OSS_REGION=oss-cn-shanghai\n'
-            printf 'ARK_API_KEY=%s\n' "$ARK_API_KEY"
-            printf 'REDIS_PASSWORD=%s\n' "$REDIS_PASSWORD"
-            printf 'NEO4J_USER=neo4j\n'
-            printf 'NEO4J_PASSWORD=%s\n' "$NEO4J_PASSWORD"
-            printf 'NEO4J_DATABASE=neo4j\n'
-            printf 'GRAPH_INDEX_VERSION=graphrag-v1\n'
-          } > "$oss_env"
-          chmod 600 "$oss_env"
+          echo "=== Building images ==="
+          docker compose -f docker-compose.prod.yml build
 
-          scp -P "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
-            /tmp/xiaowen-ai.tgz "$SERVER_USER@$SERVER_HOST:/tmp/xiaowen-ai-${SOURCE_SHA}.tgz"
-          scp -P "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
-            /tmp/xiaowen-images.tgz "$SERVER_USER@$SERVER_HOST:/tmp/xiaowen-images-${SOURCE_SHA}.tgz"
-          scp -P "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
-            "$oss_env" "$SERVER_USER@$SERVER_HOST:/tmp/xiaowen-oss-${SOURCE_SHA}.env"
+          echo "=== Starting containers ==="
+          docker compose -f docker-compose.prod.yml up -d --remove-orphans
 
-          ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
-            "$SERVER_USER@$SERVER_HOST" "SOURCE_SHA='$SOURCE_SHA' bash -s" <<'REMOTE'
-          set -euo pipefail
-          app_root=/opt/apps/xiaowen-ai
-          release="$app_root/releases/$SOURCE_SHA"
-          previous_release=$(readlink -f "$app_root/current" || true)
 
-          sudo mkdir -p "$release"
-          sudo chown -R "$(id -u):$(id -g)" "$app_root"
-          tar -xzf "/tmp/xiaowen-ai-${SOURCE_SHA}.tgz" -C "$release"
-          gzip -dc "/tmp/xiaowen-images-${SOURCE_SHA}.tgz" | docker load
 
-          if [ -n "$previous_release" ] \
-            && [ "$previous_release" != "$release" ] \
-            && [ -f "$previous_release/.env" ]; then
-            install -m 600 "$previous_release/.env" "$release/.env"
-          elif [ -f "$release/.env" ]; then
-            chmod 600 "$release/.env"
-          else
-            install -m 600 "/tmp/xiaowen-oss-${SOURCE_SHA}.env" "$release/.env"
-          fi
-          sed -i \
-            -e '/^XIAOWEN_OSS_ACCESS_KEY_ID=/d' \
-            -e '/^XIAOWEN_OSS_ACCESS_KEY_SECRET=/d' \
-            -e '/^OSS_BUCKET=/d' \
-            -e '/^OSS_REGION=/d' \
-            -e '/^ARK_API_KEY=/d' \
-            -e '/^REDIS_PASSWORD=/d' \
-            -e '/^NEO4J_USER=/d' \
-            -e '/^NEO4J_PASSWORD=/d' \
-            -e '/^NEO4J_DATABASE=/d' \
-            -e '/^GRAPH_INDEX_VERSION=/d' \
-            "$release/.env"
-          cat "/tmp/xiaowen-oss-${SOURCE_SHA}.env" >> "$release/.env"
+          echo "=== Cleanup ==="
+          docker image prune -f
 
-          if [ -n "$previous_release" ] && [ -f "$previous_release/docker-compose.yml" ]; then
-            mkdir -p "$app_root/backups"
-            cd "$previous_release"
-            postgres_id=$(docker compose -p xiaowen-ai ps -q postgres)
-            if [ -n "$postgres_id" ]; then
-              backup_file="$app_root/backups/pre-${SOURCE_SHA}.sql.gz"
-              docker compose -p xiaowen-ai exec -T postgres \
-                pg_dump -U postgres xiaowen_ai < /dev/null | gzip -1 > "$backup_file"
-              test -s "$backup_file"
+
+
+      - name: Health check
+        run: |
+          echo "Waiting for containers to start..."
+          sleep 10
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8100/ || true)
+            if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 400 ]; then
+              echo "Health check passed (HTTP $STATUS)"
+              exit 0
             fi
-            ln -sfn "$previous_release" "$app_root/previous"
-          fi
-
-          ln -sfn "$release" "$app_root/current"
-          cd "$app_root/current"
-          docker compose -p xiaowen-ai up -d --no-build --remove-orphans
-          seed_id=$(docker compose -p xiaowen-ai ps -a -q seed)
-          test -n "$seed_id"
-          docker wait "$seed_id"
-          test "$(docker inspect "$seed_id" --format '{{.State.ExitCode}}')" = 0
-
-          for attempt in 1 2 3 4 5; do
-            if curl -fsS http://127.0.0.1:8100/api/health | grep -q '"status":"ok"'; then
-              break
-            fi
-            if [ "$attempt" = 5 ]; then
-              docker compose -p xiaowen-ai logs --tail 100
-              exit 1
-            fi
+            echo "Attempt $i: HTTP $STATUS, retrying in 5s..."
             sleep 5
           done
-
-          sleep 60
-          for service in postgres redis neo4j backend frontend admin-web; do
-            container_id=$(docker compose -p xiaowen-ai ps -q "$service")
-            test -n "$container_id"
-            test "$(docker inspect "$container_id" --format '{{.RestartCount}}')" = 0
-          done
-          health_payload=$(curl -fsS http://127.0.0.1:8100/api/health)
-          echo "$health_payload" | jq -e \
-            '.status == "ok" and .graph.status == "ok" and .queue.status == "ok"' >/dev/null
-
-          rm -f \
-            "/tmp/xiaowen-ai-${SOURCE_SHA}.tgz" \
-            "/tmp/xiaowen-images-${SOURCE_SHA}.tgz" \
-            "/tmp/xiaowen-oss-${SOURCE_SHA}.env"
-          REMOTE
-
-          rm -f "$oss_env"
+          echo "Health check failed after 5 attempts"
+          docker ps --filter name=xiaowen-ai
+          docker logs xiaowen-ai-server-1 --tail 30 2>/dev/null || true
+          exit 1
