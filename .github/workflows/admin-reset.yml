@@ -198,6 +198,9 @@ jobs:
           rm -f /tmp/xiaowen-admin-direct.json /tmp/xiaowen-admin-nginx.json
           unset login_json
           echo "superadmin login verified through host port and outer nginx"
+          echo "deployment_server_public_ip=$(curl -fsS https://api.ipify.org)"
+          curl -fsS http://127.0.0.1:8100/api/health \
+            | jq -c '{status,database,uptimeSeconds,timestamp}'
           unset ADMIN_PASSWORD_B64
           echo "superadmin reset complete; rollback backup retained at $backup_file"
           REMOTE
@@ -213,7 +216,7 @@ jobs:
             if (payload?.status !== 'ok' || payload?.database !== 'ok') {
               throw new Error('public health verification returned an invalid payload');
             }
-            console.log('public service health verified');
+            console.log(`public service health verified: uptime=${payload.uptimeSeconds} timestamp=${payload.timestamp}`);
           })().catch((error) => {
             console.error(error.message);
             process.exit(1);
