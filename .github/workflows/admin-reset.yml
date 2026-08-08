@@ -126,6 +126,28 @@ jobs:
             process.exit(1);
           });
           NODE
+          login_json=$(printf '%s' "$ADMIN_PASSWORD_B64" | base64 -d \
+            | jq -Rs '{username:"superadmin", password:.}')
+          direct_status=$(curl -sS -o /tmp/xiaowen-admin-direct.json -w '%{http_code}' \
+            -X POST http://127.0.0.1:8100/api/admin/auth/login \
+            -H 'content-type: application/json' --data-binary "$login_json")
+          test "$direct_status" = "200" || {
+            echo "host-port login failed: HTTP $direct_status"
+            cat /tmp/xiaowen-admin-direct.json
+            exit 1
+          }
+          nginx_status=$(curl --noproxy '*' --resolve xiaowen.cytopia.cn:443:127.0.0.1 \
+            -sS -o /tmp/xiaowen-admin-nginx.json -w '%{http_code}' \
+            -X POST https://xiaowen.cytopia.cn/api/admin/auth/login \
+            -H 'content-type: application/json' --data-binary "$login_json")
+          test "$nginx_status" = "200" || {
+            echo "outer-nginx login failed: HTTP $nginx_status"
+            cat /tmp/xiaowen-admin-nginx.json
+            exit 1
+          }
+          rm -f /tmp/xiaowen-admin-direct.json /tmp/xiaowen-admin-nginx.json
+          unset login_json
+          echo "superadmin login verified through host port and outer nginx"
           unset ADMIN_PASSWORD_B64
           echo "superadmin reset complete; rollback backup retained at $backup_file"
           REMOTE
