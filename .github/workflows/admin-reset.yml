@@ -42,38 +42,69 @@ jobs:
           SERVER_PORT: ${{ secrets.SERVER_PORT }}
         run: |
           set -euo pipefail
-          admin_hash=$(node <<'NODE'
-          const { randomBytes, scrypt } = require('node:crypto');
-          const password = process.env.ADMIN_RESET_PASSWORD;
-          if (!password || password.length < 12) process.exit(2);
-          const salt = randomBytes(16).toString('hex');
-          scrypt(password, salt, 64, (error, derived) => {
-            if (error) throw error;
-            process.stdout.write(`scrypt$${salt}$${derived.toString('hex')}`);
-          });
-          NODE
-          )
-          admin_hash_b64=$(printf '%s' "$admin_hash" | base64 -w0)
+          admin_password_b64=$(printf '%s' "$ADMIN_RESET_PASSWORD" | base64 -w0)
           ssh -p "$SERVER_PORT" -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" \
-            "ADMIN_HASH_B64='$admin_hash_b64' bash -s" <<'REMOTE'
+            "ADMIN_PASSWORD_B64='$admin_password_b64' bash -s" <<'REMOTE'
           set -euo pipefail
           cd /opt/apps/xiaowen-ai/current
           backup_dir=/opt/apps/xiaowen-ai/backups
           backup_file="$backup_dir/superadmin-password-hash-before-$(date -u +%Y%m%dT%H%M%SZ).txt"
           install -m 700 -d "$backup_dir"
           docker compose -p xiaowen-ai exec -T postgres \
-            psql -U postgres -d xiaowen_ai -Atc \
-            "SELECT password_hash FROM platform_admin WHERE username='superadmin'" \
+            sh -lc 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+            "SELECT password_hash FROM platform_admin WHERE username='"'"'superadmin'"'"'"' \
             > "$backup_file"
           test -s "$backup_file"
           chmod 600 "$backup_file"
-          ADMIN_HASH=$(printf '%s' "$ADMIN_HASH_B64" | base64 -d)
-          export ADMIN_HASH
-          result=$(docker compose -p xiaowen-ai exec -T postgres \
-            psql -U postgres -d xiaowen_ai -v ON_ERROR_STOP=1 -qAtc \
-            "UPDATE platform_admin SET password_hash='${ADMIN_HASH}', failed_attempts=0, locked_until=NULL, must_change_password=false, status='active', updated_at=NOW() WHERE username='superadmin' RETURNING username")
-          test "$result" = "superadmin"
-          unset ADMIN_HASH ADMIN_HASH_B64
+          export ADMIN_PASSWORD_B64
+          docker compose -p xiaowen-ai exec -T \
+            -e ADMIN_PASSWORD_B64="$ADMIN_PASSWORD_B64" backend node - <<'NODE'
+          const { Client } = require('pg');
+          const {
+            hashAdminPassword,
+            verifyAdminPassword,
+          } = require('./dist/src/admin/admin-password.js');
+
+          (async () => {
+            const password = Buffer.from(process.env.ADMIN_PASSWORD_B64, 'base64').toString('utf8');
+            const passwordHash = await hashAdminPassword(password);
+            const client = new Client({
+              host: process.env.DB_HOST || 'postgres',
+              port: Number(process.env.DB_PORT || 5432),
+              database: process.env.DB_NAME || 'xiaowen_ai',
+              user: process.env.DB_USER || 'postgres',
+              password: process.env.DB_PASSWORD || 'postgres',
+            });
+            await client.connect();
+            try {
+              const result = await client.query(
+                `UPDATE platform_admin
+                 SET password_hash = $1,
+                     failed_attempts = 0,
+                     locked_until = NULL,
+                     must_change_password = false,
+                     status = 'active',
+                     updated_at = NOW()
+                 WHERE username = $2
+                 RETURNING username, password_hash`,
+                [passwordHash, 'superadmin'],
+              );
+              if (result.rowCount !== 1 || result.rows[0].username !== 'superadmin') {
+                throw new Error('superadmin row was not updated');
+              }
+              if (!await verifyAdminPassword(password, result.rows[0].password_hash)) {
+                throw new Error('stored password hash failed in-container verification');
+              }
+              console.log('superadmin password reset and hash verified inside backend container');
+            } finally {
+              await client.end();
+            }
+          })().catch((error) => {
+            console.error(error instanceof Error ? error.message : String(error));
+            process.exit(1);
+          });
+          NODE
+          unset ADMIN_PASSWORD_B64
           echo "superadmin reset complete; rollback backup retained at $backup_file"
           REMOTE
 
