@@ -86,6 +86,19 @@ jobs:
           question_b64=$(printf '%s' "$question" | base64 -w0)
 
           if [ "$MODE" = activate ]; then
+            rollback_version="$GRAPH_VERSION-rollback"
+            docker exec "$backend_id" test -f /app/dist/src/graph/prepare-production-rollback-snapshot.js
+            docker exec "$backend_id" node dist/src/graph/prepare-production-rollback-snapshot.js \
+              --enterprise-id "$enterprise_id" \
+              --source-graph-version "$GRAPH_VERSION" \
+              --rollback-graph-version "$rollback_version" \
+              --expected-count "$EXPECTED_COUNT" \
+              > "$evidence_dir/rollback-snapshot.raw.json"
+            tail -n 1 "$evidence_dir/rollback-snapshot.raw.json" | jq \
+              'walk(if type == "object" and has("enterpriseId") then .enterpriseId = "***" else . end)' \
+              > "$evidence_dir/rollback-snapshot.json"
+            jq -e '.passed == true and .generationCount == 31 and .modelCalls == 0' \
+              "$evidence_dir/rollback-snapshot.json" >/dev/null
             docker exec "$backend_id" test -f /app/dist/src/graph/verify-graph-release.js
             set +e
             docker exec "$backend_id" node dist/src/graph/verify-graph-release.js \
