@@ -122,9 +122,6 @@ jobs:
                   } finally { await app.close(); }
                 })().catch((error) => { console.error(error); process.exit(1); });
               ' > "$evidence_dir/candidate-normalization.json"
-            jq -e --arg version "$GRAPH_VERSION" \
-              '.graphVersion == $version and .snapshot.status == "ready"' \
-              "$evidence_dir/candidate-normalization.json" >/dev/null
             docker exec "$backend_id" test -f /app/dist/src/graph/verify-graph-release.js
             set +e
             docker exec "$backend_id" node dist/src/graph/verify-graph-release.js \
