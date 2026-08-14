@@ -1,0 +1,81 @@
+name: Diagnose production GraphRAG state
+run-name: "graphrag diagnose ${{ github.run_id }}"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Configure production SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Capture read-only production state
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
+            "$SERVER_USER@$SERVER_HOST" bash -s <<'REMOTE'
+          set -euo pipefail
+          evidence_dir=/tmp/graphrag-production-diagnose
+          rm -rf "$evidence_dir"
+          mkdir -p "$evidence_dir"
+          app_root=/opt/apps/xiaowen-ai
+          current_release=$(readlink -f "$app_root/current" || true)
+          printf '%s\n' "$current_release" > "$evidence_dir/current-release.txt"
+          if [ -f "$current_release/docker-compose.yml" ]; then
+            cd "$current_release"
+          else
+            cd "$app_root/releases/96f1b8ec41aab51bbcd9cf93059e59f6dfd2f48b"
+          fi
+          backend_id=$(docker compose -p xiaowen-ai ps -a -q backend)
+          postgres_id=$(docker compose -p xiaowen-ai ps -a -q postgres)
+          test -n "$postgres_id"
+          if [ -n "$backend_id" ]; then
+            docker inspect "$backend_id" --format \
+              '{"image":"{{.Image}}","running":{{.State.Running}},"health":"{{if .State.Health}}{{.State.Health.Status}}{{end}}","restartCount":{{.RestartCount}}}' \
+              > "$evidence_dir/backend-container.json"
+            docker exec "$backend_id" printenv APP_RELEASE > "$evidence_dir/backend-release.txt" 2>/dev/null || true
+          fi
+          docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+            "SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY created_at), '[]'::jsonb) FROM (SELECT enterprise_id::text, graph_version, status, expected_file_count, ready_file_count, manifest_checksum, created_at, verified_at, activated_at, failure_reason FROM graph_release) r" \
+            > "$evidence_dir/releases.json"
+          docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+            "SELECT COALESCE(jsonb_agg(to_jsonb(g) ORDER BY graph_version, status), '[]'::jsonb) FROM (SELECT graph_version, status, count(*)::int AS generation_count, sum(attempt_count)::int AS attempt_count FROM graph_generation GROUP BY graph_version, status) g" \
+            > "$evidence_dir/generation-summary.json"
+          docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+            "SELECT COALESCE(jsonb_agg(to_jsonb(g) ORDER BY file_id, graph_version), '[]'::jsonb) FROM (SELECT enterprise_id::text, file_id::text, graph_version, status, source_version, generation_key FROM graph_generation WHERE status='active') g" \
+            > "$evidence_dir/active-generations.json"
+          docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+            "SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY created_at), '[]'::jsonb) FROM (SELECT graph_version, event_type, severity, detail, created_at FROM graph_reconcile_event WHERE severity='critical' AND repaired=false) e" \
+            > "$evidence_dir/open-critical-events.json"
+          curl --silent --show-error http://127.0.0.1:8100/api/health > "$evidence_dir/health.json" || true
+          tar -czf /tmp/graphrag-production-diagnose.tgz -C "$evidence_dir" .
+          REMOTE
+          scp -P "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
+            "$SERVER_USER@$SERVER_HOST:/tmp/graphrag-production-diagnose.tgz" /tmp/graphrag-production-diagnose.tgz
+          mkdir -p evidence
+          tar -xzf /tmp/graphrag-production-diagnose.tgz -C evidence
+
+      - name: Upload production diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphrag-production-diagnose-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 7
