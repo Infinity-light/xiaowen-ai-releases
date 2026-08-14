@@ -64,6 +64,19 @@ jobs:
           new_deadlocks=-1
           new_replay_failures=-1
           open_critical=-1
+          generation_query_status=-1
+          generation_row_count=0
+          generation_summary='not attempted'
+          observed_replica_count=1
+          completed_reconciliation_cycles=0
+          same_probe_one_exit=-1
+          same_probe_two_exit=-1
+          same_probe_stderr='not attempted'
+          different_probe_one_exit=-1
+          different_probe_two_exit=-1
+          different_probe_stderr='not attempted'
+          release_probe_exit=-1
+          release_probe_stderr='not attempted'
           current_sha=$(basename "$(readlink -f "$app_root/current")")
 
           psql_value() {
@@ -117,23 +130,34 @@ jobs:
               --argjson originalExitCode "$original_status" \
               --argjson scaleExitCode "$scale_status" \
               --arg scaleOutput "$scale_output" \
+              --argjson generationQueryExitCode "$generation_query_status" \
+              --argjson generationQueryRowCount "$generation_row_count" \
+              --arg generationQuerySummary "$generation_summary" \
               --arg containersBeforeCleanup "$before_cleanup" \
               --argjson backendErrorLineCount "$backend_error_line_count" \
               --arg cleanupOutput "$cleanup_output" \
               --argjson cleanupExitCode "$cleanup_status" \
               --arg containersAfterCleanup "$after_cleanup" \
               --argjson finalReplicaCount "$remaining" \
-              --argjson replicaCount 2 \
-              --argjson reconciliationCycles 2 \
+              --argjson replicaCount "$observed_replica_count" \
+              --argjson reconciliationCycles "$completed_reconciliation_cycles" \
               --argjson sameGenerationAcquired "$same_acquired" \
               --argjson sameGenerationYielded "$same_yielded" \
+              --argjson sameProbeOneExit "$same_probe_one_exit" \
+              --argjson sameProbeTwoExit "$same_probe_two_exit" \
+              --arg sameProbeStderr "$same_probe_stderr" \
               --argjson differentGenerationAcquired "$different_acquired" \
+              --argjson differentProbeOneExit "$different_probe_one_exit" \
+              --argjson differentProbeTwoExit "$different_probe_two_exit" \
+              --arg differentProbeStderr "$different_probe_stderr" \
               --arg released "$released" \
+              --argjson releaseProbeExit "$release_probe_exit" \
+              --arg releaseProbeStderr "$release_probe_stderr" \
               --argjson newCritical "$new_critical" \
               --argjson newDeadlocks "$new_deadlocks" \
               --argjson newReplayFailures "$new_replay_failures" \
               --argjson openCritical "$open_critical" \
-              '{result:$result,release:$release,startedAt:$startedAt,finishedAt:$finishedAt,phaseAtExit:$phaseAtExit,originalExitCode:$originalExitCode,scale:{exitCode:$scaleExitCode,output:$scaleOutput},diagnostics:{containersBeforeCleanup:$containersBeforeCleanup,backendErrorLineCount:$backendErrorLineCount,cleanupOutput:$cleanupOutput,cleanupExitCode:$cleanupExitCode,containersAfterCleanup:$containersAfterCleanup,finalReplicaCount:$finalReplicaCount},replicaCount:$replicaCount,reconciliationCycles:$reconciliationCycles,sameGeneration:{acquired:$sameGenerationAcquired,yielded:$sameGenerationYielded},differentGenerations:{acquired:$differentGenerationAcquired},lockReleased:($released == "true"),events:{newCritical:$newCritical,newDeadlocks:$newDeadlocks,newReplayFailures:$newReplayFailures,openCritical:$openCritical}}' \
+              '{result:$result,release:$release,startedAt:$startedAt,finishedAt:$finishedAt,phaseAtExit:$phaseAtExit,originalExitCode:$originalExitCode,generationQuery:{exitCode:$generationQueryExitCode,rowCount:$generationQueryRowCount,summary:$generationQuerySummary},scale:{exitCode:$scaleExitCode,output:$scaleOutput},diagnostics:{containersBeforeCleanup:$containersBeforeCleanup,backendErrorLineCount:$backendErrorLineCount,cleanupOutput:$cleanupOutput,cleanupExitCode:$cleanupExitCode,containersAfterCleanup:$containersAfterCleanup,finalReplicaCount:$finalReplicaCount},replicaCount:$replicaCount,reconciliationCycles:$reconciliationCycles,sameGeneration:{acquired:$sameGenerationAcquired,yielded:$sameGenerationYielded,probeOneExit:$sameProbeOneExit,probeTwoExit:$sameProbeTwoExit,stderr:$sameProbeStderr},differentGenerations:{acquired:$differentGenerationAcquired,probeOneExit:$differentProbeOneExit,probeTwoExit:$differentProbeTwoExit,stderr:$differentProbeStderr},lockReleased:($released == "true"),releaseProbe:{exitCode:$releaseProbeExit,stderr:$releaseProbeStderr},events:{newCritical:$newCritical,newDeadlocks:$newDeadlocks,newReplayFailures:$newReplayFailures,openCritical:$openCritical}}' \
               > "$evidence_file"
             sha256sum "$evidence_file"
             cat "$evidence_file"
@@ -145,7 +169,17 @@ jobs:
           test "$current_sha" = "$EXPECTED_SHA"
           phase=select_verified_generations
           before_event_id=$(psql_value "SELECT coalesce(max(id),0) FROM graph_reconcile_event;")
+          set +e
           generation_rows=$(psql_value "SELECT enterprise_id || '|' || generation_key FROM graph_generation WHERE graph_version='graphrag-v3' AND status='verified' AND checksum_version=2 ORDER BY expected_entity_count + expected_relation_count DESC, generation_key LIMIT 2;")
+          generation_query_status=$?
+          set -e
+          generation_row_count=$(printf '%s\n' "$generation_rows" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+          generation_summary=$(printf '%s\n' "$generation_rows" \
+            | awk -F'|' 'NF >= 2 { printf "%sgeneration=%s...", separator, substr($2, 1, 12); separator="," }')
+          if [ "$generation_query_status" != 0 ]; then
+            echo "::error::Verified generation query failed"
+            exit 46
+          fi
           generation_one=$(printf '%s\n' "$generation_rows" | sed -n '1p')
           generation_two=$(printf '%s\n' "$generation_rows" | sed -n '2p')
           if [ -z "$generation_one" ] || [ -z "$generation_two" ]; then
@@ -193,10 +227,11 @@ jobs:
               exit 44
             fi
           done
+          observed_replica_count=2
 
           phase=same_generation_lock_probe
           cat > /tmp/graphrag-lock-probe.js <<'NODE'
-          const { Client } = require('pg');
+          const { Client } = require('/app/node_modules/pg');
           (async () => {
             const identity = process.argv[2];
             const holdMs = Number(process.argv[3] || 0);
@@ -237,33 +272,67 @@ jobs:
             docker cp /tmp/graphrag-lock-probe.js "$container_id:/tmp/graphrag-lock-probe.js"
           done
 
-          docker exec "${backend_ids[0]}" node /tmp/graphrag-lock-probe.js "$identity_one" 5000 > /tmp/same-one.json &
+          docker exec "${backend_ids[0]}" node /tmp/graphrag-lock-probe.js "$identity_one" 5000 > /tmp/same-one.json 2> /tmp/same-one.err &
           same_one_pid=$!
-          docker exec "${backend_ids[1]}" node /tmp/graphrag-lock-probe.js "$identity_one" 5000 > /tmp/same-two.json &
+          docker exec "${backend_ids[1]}" node /tmp/graphrag-lock-probe.js "$identity_one" 5000 > /tmp/same-two.json 2> /tmp/same-two.err &
           same_two_pid=$!
+          set +e
           wait "$same_one_pid"
+          same_probe_one_exit=$?
           wait "$same_two_pid"
+          same_probe_two_exit=$?
+          set -e
+          same_probe_stderr=$(cat /tmp/same-one.err /tmp/same-two.err \
+            | sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}/[redacted-uuid]/g; s/[0-9a-fA-F]{40,}/[redacted-hash]/g; s/sk-[A-Za-z0-9_-]+/[redacted-key]/g' \
+            | tail -c 2000)
+          if [ "$same_probe_one_exit" != 0 ] || [ "$same_probe_two_exit" != 0 ]; then
+            echo "::error::Same-generation lock probe process failed"
+            exit 47
+          fi
           same_acquired=$(jq -s '[.[].acquired] | map(select(. == true)) | length' /tmp/same-one.json /tmp/same-two.json)
           same_yielded=$(jq -s '[.[].acquired] | map(select(. == false)) | length' /tmp/same-one.json /tmp/same-two.json)
           test "$same_acquired" = 1
           test "$same_yielded" = 1
 
           phase=different_generation_lock_probe
-          docker exec "${backend_ids[0]}" node /tmp/graphrag-lock-probe.js "$identity_one" 5000 > /tmp/different-one.json &
+          docker exec "${backend_ids[0]}" node /tmp/graphrag-lock-probe.js "$identity_one" 5000 > /tmp/different-one.json 2> /tmp/different-one.err &
           different_one_pid=$!
-          docker exec "${backend_ids[1]}" node /tmp/graphrag-lock-probe.js "$identity_two" 5000 > /tmp/different-two.json &
+          docker exec "${backend_ids[1]}" node /tmp/graphrag-lock-probe.js "$identity_two" 5000 > /tmp/different-two.json 2> /tmp/different-two.err &
           different_two_pid=$!
+          set +e
           wait "$different_one_pid"
+          different_probe_one_exit=$?
           wait "$different_two_pid"
+          different_probe_two_exit=$?
+          set -e
+          different_probe_stderr=$(cat /tmp/different-one.err /tmp/different-two.err \
+            | sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}/[redacted-uuid]/g; s/[0-9a-fA-F]{40,}/[redacted-hash]/g; s/sk-[A-Za-z0-9_-]+/[redacted-key]/g' \
+            | tail -c 2000)
+          if [ "$different_probe_one_exit" != 0 ] || [ "$different_probe_two_exit" != 0 ]; then
+            echo "::error::Different-generation lock probe process failed"
+            exit 48
+          fi
           different_acquired=$(jq -s '[.[].acquired] | map(select(. == true)) | length' /tmp/different-one.json /tmp/different-two.json)
           test "$different_acquired" = 2
 
-          released=$(docker exec "${backend_ids[1]}" node /tmp/graphrag-lock-probe.js "$identity_one" 0 | jq -r '.acquired')
+          set +e
+          docker exec "${backend_ids[1]}" node /tmp/graphrag-lock-probe.js "$identity_one" 0 \
+            > /tmp/release-probe.json 2> /tmp/release-probe.err
+          release_probe_exit=$?
+          set -e
+          release_probe_stderr=$(sed -E 's/[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}/[redacted-uuid]/g; s/[0-9a-fA-F]{40,}/[redacted-hash]/g; s/sk-[A-Za-z0-9_-]+/[redacted-key]/g' \
+            /tmp/release-probe.err | tail -c 2000)
+          if [ "$release_probe_exit" != 0 ]; then
+            echo "::error::Lock release probe process failed"
+            exit 49
+          fi
+          released=$(jq -r '.acquired' /tmp/release-probe.json)
           test "$released" = true
 
           # Two full reconciliation cycles with both physical replicas online.
           phase=two_reconciliation_cycles
           sleep 135
+          completed_reconciliation_cycles=2
 
           phase=post_cycle_event_gate
           new_critical=$(psql_value "SELECT count(*) FROM graph_reconcile_event WHERE id > ${before_event_id} AND severity='critical';")
@@ -293,6 +362,28 @@ jobs:
           scp -P "$SERVER_PORT" -i ~/.ssh/deploy_key \
             "$SERVER_USER@$SERVER_HOST:/opt/apps/xiaowen-ai/runtime-evidence/graphrag-replica-lock-${GITHUB_RUN_ID}.json" \
             graphrag-replica-lock-evidence.json
+          jq -e '
+            .result == "success"
+            and .phaseAtExit == "completed"
+            and .generationQuery.exitCode == 0
+            and .generationQuery.rowCount >= 2
+            and .replicaCount == 2
+            and .reconciliationCycles == 2
+            and .sameGeneration.acquired == 1
+            and .sameGeneration.yielded == 1
+            and .sameGeneration.probeOneExit == 0
+            and .sameGeneration.probeTwoExit == 0
+            and .differentGenerations.acquired == 2
+            and .differentGenerations.probeOneExit == 0
+            and .differentGenerations.probeTwoExit == 0
+            and .lockReleased == true
+            and .releaseProbe.exitCode == 0
+            and .events.newCritical == 0
+            and .events.newDeadlocks == 0
+            and .events.newReplayFailures == 0
+            and .events.openCritical == 0
+            and .diagnostics.finalReplicaCount == 1
+          ' graphrag-replica-lock-evidence.json
 
       - uses: actions/upload-artifact@v4
         if: always()
