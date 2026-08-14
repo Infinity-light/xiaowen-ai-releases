@@ -156,6 +156,7 @@ jobs:
             printf 'XIAOWEN_OSS_ACCESS_KEY_ID=%s\n' "$XIAOWEN_OSS_ACCESS_KEY_ID"
             printf 'XIAOWEN_OSS_ACCESS_KEY_SECRET=%s\n' "$XIAOWEN_OSS_ACCESS_KEY_SECRET"
             printf 'DEEPSEEK_API_KEY=%s\n' "$DEEPSEEK_API_KEY"
+            printf 'DEEPSEEK_MODEL=deepseek-v4-flash\n'
             printf 'SILICONFLOW_API_KEY=%s\n' "$SILICONFLOW_API_KEY"
             printf 'OSS_BUCKET=clouddreamai\n'
             printf 'OSS_REGION=oss-cn-shanghai\n'
@@ -176,11 +177,14 @@ jobs:
             printf 'GRAPH_EXTRACTION_CHUNK_SIZE=1500\n'
             printf 'GRAPH_EXTRACTION_OVERLAP=150\n'
             printf 'GRAPH_EXTRACTION_PRIMARY_PROVIDER=deepseek\n'
+            printf 'GRAPH_EXTRACTION_PRIMARY_MODEL=deepseek-v4-flash\n'
             printf 'GRAPH_EXTRACTION_FALLBACK_PROVIDER=siliconflow\n'
             printf 'GRAPH_EXTRACTION_FALLBACK_BASE_URL=https://api.siliconflow.cn/v1\n'
             printf 'GRAPH_EXTRACTION_FALLBACK_MODEL=Qwen/Qwen2.5-14B-Instruct\n'
             printf 'GRAPH_EXTRACTION_SECONDARY_FALLBACK_PROVIDER=siliconflow-secondary\n'
             printf 'GRAPH_EXTRACTION_SECONDARY_FALLBACK_MODEL=Qwen/Qwen3.5-9B\n'
+            printf 'RETRIEVAL_RERANK_MODEL=deepseek-v4-flash\n'
+            printf 'ANSWER_PRIMARY_MODEL=deepseek-v4-flash\n'
           } > "$oss_env"
           chmod 600 "$oss_env"
 
@@ -333,6 +337,7 @@ jobs:
             -e '/^XIAOWEN_OSS_ACCESS_KEY_ID=/d' \
             -e '/^XIAOWEN_OSS_ACCESS_KEY_SECRET=/d' \
             -e '/^DEEPSEEK_API_KEY=/d' \
+            -e '/^DEEPSEEK_MODEL=/d' \
             -e '/^SILICONFLOW_API_KEY=/d' \
             -e '/^OSS_BUCKET=/d' \
             -e '/^OSS_REGION=/d' \
@@ -353,11 +358,14 @@ jobs:
             -e '/^GRAPH_EXTRACTION_CHUNK_SIZE=/d' \
             -e '/^GRAPH_EXTRACTION_OVERLAP=/d' \
             -e '/^GRAPH_EXTRACTION_PRIMARY_PROVIDER=/d' \
+            -e '/^GRAPH_EXTRACTION_PRIMARY_MODEL=/d' \
             -e '/^GRAPH_EXTRACTION_FALLBACK_PROVIDER=/d' \
             -e '/^GRAPH_EXTRACTION_FALLBACK_BASE_URL=/d' \
             -e '/^GRAPH_EXTRACTION_FALLBACK_MODEL=/d' \
             -e '/^GRAPH_EXTRACTION_SECONDARY_FALLBACK_PROVIDER=/d' \
             -e '/^GRAPH_EXTRACTION_SECONDARY_FALLBACK_MODEL=/d' \
+            -e '/^RETRIEVAL_RERANK_MODEL=/d' \
+            -e '/^ANSWER_PRIMARY_MODEL=/d' \
             "$release/.env"
           cat "/tmp/xiaowen-oss-${SOURCE_SHA}.env" >> "$release/.env"
 
