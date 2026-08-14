@@ -144,8 +144,16 @@ jobs:
                         max(last_success_at) AS newest_success_at
                  FROM graph_generation WHERE enterprise_id='$enterprise_id'
                  GROUP BY graph_version, status
-               ) summary" \
+              ) summary" \
               > "$evidence_dir/generation-summary.json"
+            docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+              "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                 'eventType', event_type, 'severity', severity, 'detail', detail,
+                 'createdAt', created_at
+               ) ORDER BY created_at), '[]'::jsonb)
+               FROM graph_reconcile_event WHERE enterprise_id='$enterprise_id'
+                 AND severity='critical' AND repaired=false" \
+              > "$evidence_dir/open-critical-events.json"
 
             if [ "$verifier_status" -eq 0 ]; then
               tail -n 1 "$evidence_dir/release-gates.raw.json" | jq \
