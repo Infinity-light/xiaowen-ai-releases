@@ -1,0 +1,56 @@
+name: Recover Xiaowen production runtime
+run-name: "recover production runtime"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    permissions:
+      contents: read
+    steps:
+      - name: Recover current verified runtime
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
+            "$SERVER_USER@$SERVER_HOST" bash -s <<'REMOTE'
+          set -euo pipefail
+          current_release=$(readlink -f /opt/apps/xiaowen-ai/current)
+          test -f "$current_release/docker-compose.yml"
+          cd "$current_release"
+          postgres_id=$(docker compose -p xiaowen-ai ps -a -q postgres)
+          test -n "$postgres_id"
+          active_version=$(docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+            "SELECT graph_version FROM graph_release WHERE status='active'")
+          test "$active_version" = graphrag-v3
+          docker compose -p xiaowen-ai up -d --no-build --remove-orphans
+          sleep 10
+          for service in backend frontend admin-web; do
+            container_id=$(docker compose -p xiaowen-ai ps -q "$service")
+            test -n "$container_id"
+            test "$(docker inspect "$container_id" --format '{{.State.Running}}')" = true
+            test "$(docker inspect "$container_id" --format '{{.State.Health.Status}}')" = healthy
+            test "$(docker inspect "$container_id" --format '{{.RestartCount}}')" = 0
+          done
+          payload=$(curl --fail --silent --show-error http://127.0.0.1:8100/api/health)
+          echo "$payload" | jq -e \
+            '.status=="ok" and .graph.status=="ok" and .queue.status=="ok" and (.graphRelease.activeVersions | any(.graphVersion=="graphrag-v3"))' \
+            >/dev/null
+          sleep 60
+          payload=$(curl --fail --silent --show-error http://127.0.0.1:8100/api/health)
+          echo "$payload" | jq -e \
+            '.status=="ok" and .graph.status=="ok" and .queue.status=="ok" and (.graphRelease.activeVersions | any(.graphVersion=="graphrag-v3"))' \
+            >/dev/null
+          printf '%s\n' "$payload"
+          REMOTE
