@@ -395,3 +395,40 @@ jobs:
           REMOTE
 
           rm -f "$oss_env"
+
+      - name: Verify production health
+        shell: bash
+        run: |
+          set -euo pipefail
+          health_payload=$(curl --fail --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
+            https://xiaowen.cytopia.cn/api/health)
+          echo "$health_payload" | jq -e \
+            '.status == "ok" and .graph.status == "ok" and .queue.status == "ok"' >/dev/null
+
+      - name: Verify deployment stability
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
+            "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/apps/xiaowen-ai/current
+          for service in postgres redis neo4j backend frontend admin-web; do
+            container_id=$(docker compose -p xiaowen-ai ps -q "$service")
+            test -n "$container_id"
+            test "$(docker inspect "$container_id" --format '{{.RestartCount}}')" = 0
+          done
+          REMOTE
+
+      - name: Smoke production frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --output /dev/null \
+            --connect-timeout 10 --max-time 30 \
+            https://xiaowen.cytopia.cn/
