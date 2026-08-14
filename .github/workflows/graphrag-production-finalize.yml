@@ -87,28 +87,70 @@ jobs:
 
           if [ "$MODE" = activate ]; then
             docker exec "$backend_id" test -f /app/dist/src/graph/verify-graph-release.js
+            set +e
             docker exec "$backend_id" node dist/src/graph/verify-graph-release.js \
               --enterprise-id "$enterprise_id" \
               --graph-version "$GRAPH_VERSION" \
               --question-base64 "$question_b64" \
               --role admin \
               --performance-limit-ms 120000 \
-              > "$evidence_dir/release-gates.raw.json"
-            tail -n 1 "$evidence_dir/release-gates.raw.json" | jq \
-              'walk(if type == "object" and has("enterpriseId") then .enterpriseId = "***" else . end)' \
-              > "$evidence_dir/release-gates.json"
+              > "$evidence_dir/release-gates.raw.json" \
+              2> "$evidence_dir/release-gates.error.log"
+            verifier_status=$?
+            set -e
+            printf '%s\n' "$verifier_status" > "$evidence_dir/command-status"
+            docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+              "WITH latest AS (
+                 SELECT run_id FROM graph_release_gate_run
+                 WHERE enterprise_id='$enterprise_id' AND graph_version='$GRAPH_VERSION'
+                 ORDER BY checked_at DESC LIMIT 1
+               )
+               SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                 'gateType', gate_type, 'status', status, 'metrics', metrics,
+                 'evidenceRefs', evidence_refs, 'productionRelease', production_release,
+                 'checkedAt', checked_at, 'expiresAt', expires_at
+               ) ORDER BY gate_type), '[]'::jsonb)
+               FROM graph_release_gate_run WHERE enterprise_id='$enterprise_id'
+                 AND graph_version='$GRAPH_VERSION' AND run_id=(SELECT run_id FROM latest)" \
+              > "$evidence_dir/latest-gate-runs.json"
+            docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+              "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                 'graphVersion', graph_version, 'status', status,
+                 'expectedFileCount', expected_file_count, 'readyFileCount', ready_file_count,
+                 'verifiedAt', verified_at, 'activatedAt', activated_at,
+                 'failureReason', failure_reason
+               ) ORDER BY created_at), '[]'::jsonb)
+               FROM graph_release WHERE enterprise_id='$enterprise_id'" \
+              > "$evidence_dir/releases.json"
+            docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+              "SELECT COALESCE(jsonb_agg(to_jsonb(summary) ORDER BY graph_version, status), '[]'::jsonb)
+               FROM (
+                 SELECT graph_version, status, count(*) AS generation_count,
+                        sum(attempt_count) AS attempt_count,
+                        min(last_success_at) AS oldest_success_at,
+                        max(last_success_at) AS newest_success_at
+                 FROM graph_generation WHERE enterprise_id='$enterprise_id'
+                 GROUP BY graph_version, status
+               ) summary" \
+              > "$evidence_dir/generation-summary.json"
 
-            docker exec "$backend_id" test -f /app/dist/src/graph/verify-generation-idempotency.js
-            docker exec "$backend_id" node dist/src/graph/verify-generation-idempotency.js \
-              --enterprise-id "$enterprise_id" \
-              --graph-version "$GRAPH_VERSION" \
-              --expected-count "$EXPECTED_COUNT" \
-              > "$evidence_dir/generation-idempotency.raw.json"
-            tail -n 1 "$evidence_dir/generation-idempotency.raw.json" | jq \
-              'walk(if type == "object" and has("enterpriseId") then .enterpriseId = "***" else . end)' \
-              > "$evidence_dir/generation-idempotency.json"
-            jq -e '.passed == true and .generationCount == 31 and .extractionModelCalls == 0 and .embeddingModelCalls == 0 and .attemptCount.delta == 0' \
-              "$evidence_dir/generation-idempotency.json" >/dev/null
+            if [ "$verifier_status" -eq 0 ]; then
+              tail -n 1 "$evidence_dir/release-gates.raw.json" | jq \
+                'walk(if type == "object" and has("enterpriseId") then .enterpriseId = "***" else . end)' \
+                > "$evidence_dir/release-gates.json"
+
+              docker exec "$backend_id" test -f /app/dist/src/graph/verify-generation-idempotency.js
+              docker exec "$backend_id" node dist/src/graph/verify-generation-idempotency.js \
+                --enterprise-id "$enterprise_id" \
+                --graph-version "$GRAPH_VERSION" \
+                --expected-count "$EXPECTED_COUNT" \
+                > "$evidence_dir/generation-idempotency.raw.json"
+              tail -n 1 "$evidence_dir/generation-idempotency.raw.json" | jq \
+                'walk(if type == "object" and has("enterpriseId") then .enterpriseId = "***" else . end)' \
+                > "$evidence_dir/generation-idempotency.json"
+              jq -e '.passed == true and .generationCount == 31 and .extractionModelCalls == 0 and .embeddingModelCalls == 0 and .attemptCount.delta == 0' \
+                "$evidence_dir/generation-idempotency.json" >/dev/null
+            fi
           else
             docker exec "$backend_id" test -f /app/dist/src/graph/finalize-production-canary.js
             docker exec "$backend_id" node dist/src/graph/finalize-production-canary.js \
@@ -126,9 +168,12 @@ jobs:
 
           curl --fail --silent --show-error http://127.0.0.1:8100/api/health \
             > "$evidence_dir/health.json"
-          jq -e --arg version "$GRAPH_VERSION" \
-            '.status == "ok" and .graph.status == "ok" and (.graphRelease.activeVersions | any(.graphVersion == $version))' \
-            "$evidence_dir/health.json" >/dev/null
+          if [ ! -f "$evidence_dir/command-status" ] \
+            || [ "$(cat "$evidence_dir/command-status")" -eq 0 ]; then
+            jq -e --arg version "$GRAPH_VERSION" \
+              '.status == "ok" and .graph.status == "ok" and (.graphRelease.activeVersions | any(.graphVersion == $version))' \
+              "$evidence_dir/health.json" >/dev/null
+          fi
           tar -czf "/tmp/graphrag-production-$MODE.tgz" -C "$evidence_dir" .
           REMOTE
 
@@ -137,6 +182,10 @@ jobs:
             "/tmp/graphrag-production-$MODE.tgz"
           mkdir -p evidence
           tar -xzf "/tmp/graphrag-production-$MODE.tgz" -C evidence
+          if [ -f evidence/command-status ] && [ "$(cat evidence/command-status)" -ne 0 ]; then
+            cat evidence/release-gates.error.log
+            exit 1
+          fi
 
       - name: Upload production evidence
         if: always()
