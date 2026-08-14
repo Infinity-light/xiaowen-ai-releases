@@ -113,6 +113,8 @@ jobs:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           XIAOWEN_OSS_ACCESS_KEY_ID: ${{ secrets.XIAOWEN_OSS_ACCESS_KEY_ID }}
           XIAOWEN_OSS_ACCESS_KEY_SECRET: ${{ secrets.XIAOWEN_OSS_ACCESS_KEY_SECRET }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
           ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
           REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
           NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
@@ -122,6 +124,8 @@ jobs:
           test -n "$SOURCE_SHA"
           test -n "$XIAOWEN_OSS_ACCESS_KEY_ID"
           test -n "$XIAOWEN_OSS_ACCESS_KEY_SECRET"
+          test -n "$DEEPSEEK_API_KEY"
+          test -n "$SILICONFLOW_API_KEY"
           test -n "$ARK_API_KEY"
           test -n "$REDIS_PASSWORD"
           test -n "$NEO4J_PASSWORD"
@@ -134,6 +138,8 @@ jobs:
           {
             printf 'XIAOWEN_OSS_ACCESS_KEY_ID=%s\n' "$XIAOWEN_OSS_ACCESS_KEY_ID"
             printf 'XIAOWEN_OSS_ACCESS_KEY_SECRET=%s\n' "$XIAOWEN_OSS_ACCESS_KEY_SECRET"
+            printf 'DEEPSEEK_API_KEY=%s\n' "$DEEPSEEK_API_KEY"
+            printf 'SILICONFLOW_API_KEY=%s\n' "$SILICONFLOW_API_KEY"
             printf 'OSS_BUCKET=clouddreamai\n'
             printf 'OSS_REGION=oss-cn-shanghai\n'
             printf 'ARK_API_KEY=%s\n' "$ARK_API_KEY"
@@ -178,6 +184,8 @@ jobs:
           sed -i \
             -e '/^XIAOWEN_OSS_ACCESS_KEY_ID=/d' \
             -e '/^XIAOWEN_OSS_ACCESS_KEY_SECRET=/d' \
+            -e '/^DEEPSEEK_API_KEY=/d' \
+            -e '/^SILICONFLOW_API_KEY=/d' \
             -e '/^OSS_BUCKET=/d' \
             -e '/^OSS_REGION=/d' \
             -e '/^ARK_API_KEY=/d' \
