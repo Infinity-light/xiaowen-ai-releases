@@ -1,5 +1,5 @@
 name: Deploy Xiaowen AI
-run-name: "deploy ${{ github.event.client_payload.source_sha }} [${{ github.event.client_payload.dispatch_id }}]"
+run-name: "deploy ${{ github.event.client_payload.source_sha || github.event.client_payload.ref || inputs.ref }} [${{ github.event.client_payload.dispatch_id || 'manual' }}]"
 
 
 on:
@@ -82,25 +82,42 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
             "$SERVER_USER@$SERVER_HOST" \
-            'rm -f /tmp/xiaowen-ai-*.tgz /tmp/xiaowen-images-*.tgz /tmp/xiaowen-oss-*.env && docker image prune -f'
+            'rm -f /tmp/xiaowen-ai-*.tgz /tmp/xiaowen-images-*.tgz /tmp/xiaowen-oss-*.env'
 
       - name: Build release images
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.ref }}
         shell: bash
         run: |
           set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           tar --exclude=.git --exclude=.workflow --exclude=node_modules --exclude=dist --exclude=.env \
             -czf /tmp/xiaowen-ai.tgz .
-          docker build -t xiaowen-ai-backend:latest backend
-          docker tag xiaowen-ai-backend:latest xiaowen-ai-seed:latest
-          docker build -t xiaowen-ai-frontend:latest frontend
-          docker build -t xiaowen-ai-admin-web:latest admin-web
+          docker build \
+            -t "xiaowen-ai-backend:${SOURCE_SHA}" \
+            -t xiaowen-ai-backend:latest \
+            backend
+          docker tag "xiaowen-ai-backend:${SOURCE_SHA}" "xiaowen-ai-seed:${SOURCE_SHA}"
+          docker tag "xiaowen-ai-backend:${SOURCE_SHA}" xiaowen-ai-seed:latest
+          docker build \
+            -t "xiaowen-ai-frontend:${SOURCE_SHA}" \
+            -t xiaowen-ai-frontend:latest \
+            frontend
+          docker build \
+            -t "xiaowen-ai-admin-web:${SOURCE_SHA}" \
+            -t xiaowen-ai-admin-web:latest \
+            admin-web
           docker pull redis:7.4-alpine
           docker pull neo4j:5.26.12-community
           docker save \
             xiaowen-ai-backend:latest \
+            "xiaowen-ai-backend:${SOURCE_SHA}" \
             xiaowen-ai-seed:latest \
+            "xiaowen-ai-seed:${SOURCE_SHA}" \
             xiaowen-ai-frontend:latest \
+            "xiaowen-ai-frontend:${SOURCE_SHA}" \
             xiaowen-ai-admin-web:latest \
+            "xiaowen-ai-admin-web:${SOURCE_SHA}" \
             redis:7.4-alpine \
             neo4j:5.26.12-community | gzip -1 > /tmp/xiaowen-images.tgz
 
@@ -148,8 +165,12 @@ jobs:
             printf 'NEO4J_PASSWORD=%s\n' "$NEO4J_PASSWORD"
             printf 'NEO4J_DATABASE=neo4j\n'
             printf 'APP_RELEASE=%s\n' "$SOURCE_SHA"
-          printf 'GRAPH_INDEX_VERSION=graphrag-v3\n'
-          printf 'GRAPH_BOOTSTRAP_ACTIVE_VERSION=graphrag-v1\n'
+            printf 'GRAPH_INDEX_VERSION=graphrag-v3\n'
+            printf 'GRAPH_BOOTSTRAP_ACTIVE_VERSION=graphrag-v1\n'
+            printf 'GRAPH_EXTRACTION_PRIMARY_PROVIDER=deepseek\n'
+            printf 'GRAPH_EXTRACTION_FALLBACK_PROVIDER=siliconflow\n'
+            printf 'GRAPH_EXTRACTION_FALLBACK_BASE_URL=https://api.siliconflow.cn/v1\n'
+            printf 'GRAPH_EXTRACTION_FALLBACK_MODEL=deepseek-ai/DeepSeek-V4-Flash\n'
           } > "$oss_env"
           chmod 600 "$oss_env"
 
@@ -166,10 +187,127 @@ jobs:
           app_root=/opt/apps/xiaowen-ai
           release="$app_root/releases/$SOURCE_SHA"
           previous_release=$(readlink -f "$app_root/current" || true)
+          rollback_armed=false
+          deployment_committed=false
+
+          rollback_deployment() {
+            original_status="$1"
+            trap - EXIT
+            if [ "$original_status" -eq 0 ] \
+              || [ "$rollback_armed" != true ] \
+              || [ "$deployment_committed" = true ]; then
+              exit "$original_status"
+            fi
+
+            set +e
+            echo "::error::Candidate release $release failed; rolling back to ${previous_release:-<none>}"
+            if [ -f "$release/docker-compose.yml" ]; then
+              cd "$release"
+              docker compose -p xiaowen-ai logs --tail 120 || true
+            fi
+
+            rollback_ok=true
+            if [ -z "$previous_release" ] \
+              || [ "$previous_release" = "$release" ] \
+              || [ ! -f "$previous_release/docker-compose.yml" ]; then
+              echo "::error::No valid previous release is available for automatic rollback"
+              rollback_ok=false
+            fi
+
+            if [ "$rollback_ok" = true ]; then
+              rollback_sha=$(basename "$previous_release")
+              for service in backend seed frontend admin-web; do
+                rollback_image="xiaowen-ai-${service}:${rollback_sha}"
+                if ! docker image inspect "$rollback_image" >/dev/null 2>&1; then
+                  echo "::error::Missing rollback image $rollback_image"
+                  rollback_ok=false
+                  continue
+                fi
+                docker image tag "$rollback_image" "xiaowen-ai-${service}:latest" || rollback_ok=false
+              done
+            fi
+
+            if [ "$rollback_ok" = true ]; then
+              ln -sfn "$previous_release" "$app_root/current" || rollback_ok=false
+              cd "$app_root/current" || rollback_ok=false
+            fi
+            if [ "$rollback_ok" = true ]; then
+              timeout 240 docker compose -p xiaowen-ai up -d --no-build --remove-orphans || rollback_ok=false
+            fi
+
+            if [ "$rollback_ok" = true ]; then
+              rollback_health_ok=false
+              for attempt in 1 2 3 4 5; do
+                rollback_payload=$(curl -fsS http://127.0.0.1:8100/api/health || true)
+                if echo "$rollback_payload" | jq -e \
+                  '.status == "ok" and .graph.status == "ok" and .queue.status == "ok"' >/dev/null 2>&1; then
+                  rollback_health_ok=true
+                  break
+                fi
+                sleep 5
+              done
+              if [ "$rollback_health_ok" != true ]; then
+                echo "::error::Rollback boot health failed"
+                rollback_ok=false
+              fi
+            fi
+
+            if [ "$rollback_ok" = true ]; then
+              sleep 60
+              for service in backend frontend admin-web; do
+                container_id=$(docker compose -p xiaowen-ai ps -q "$service")
+                if [ -z "$container_id" ] \
+                  || [ "$(docker inspect "$container_id" --format '{{.State.Running}}')" != true ] \
+                  || [ "$(docker inspect "$container_id" --format '{{.RestartCount}}')" != 0 ]; then
+                  echo "::error::Rollback $service is not running stably"
+                  rollback_ok=false
+                fi
+              done
+              frontend_id=$(docker compose -p xiaowen-ai ps -q frontend)
+              if [ -z "$frontend_id" ]; then
+                echo "::error::Rollback frontend is not running"
+                rollback_ok=false
+              fi
+              rollback_payload=$(curl -fsS http://127.0.0.1:8100/api/health || true)
+              if ! echo "$rollback_payload" | jq -e \
+                '.status == "ok" and .graph.status == "ok" and .queue.status == "ok"' >/dev/null 2>&1; then
+                echo "::error::Rollback health degraded after stability window: $rollback_payload"
+                rollback_ok=false
+              fi
+            fi
+
+            if [ "$rollback_ok" = true ]; then
+              echo "Automatic rollback succeeded: $previous_release"
+            else
+              echo "::error::Automatic rollback failed; production requires operator recovery"
+              if [ -f "$app_root/current/docker-compose.yml" ]; then
+                cd "$app_root/current"
+                docker compose -p xiaowen-ai ps -a || true
+                docker compose -p xiaowen-ai logs --tail 120 || true
+              fi
+            fi
+            exit "$original_status"
+          }
+          trap 'rollback_deployment "$?"' EXIT
 
           sudo mkdir -p "$release"
           sudo chown -R "$(id -u):$(id -g)" "$app_root"
           tar -xzf "/tmp/xiaowen-ai-${SOURCE_SHA}.tgz" -C "$release"
+
+          if [ -n "$previous_release" ] \
+            && [ "$previous_release" != "$release" ] \
+            && [ -f "$previous_release/docker-compose.yml" ]; then
+            previous_sha=$(basename "$previous_release")
+            [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]]
+            cd "$previous_release"
+            for service in backend seed frontend admin-web; do
+              container_id=$(docker compose -p xiaowen-ai ps -a -q "$service")
+              test -n "$container_id"
+              image_id=$(docker inspect "$container_id" --format '{{.Image}}')
+              test -n "$image_id"
+              docker image tag "$image_id" "xiaowen-ai-${service}:${previous_sha}"
+            done
+          fi
           gzip -dc "/tmp/xiaowen-images-${SOURCE_SHA}.tgz" | docker load
 
           if [ -n "$previous_release" ] \
@@ -196,6 +334,10 @@ jobs:
             -e '/^APP_RELEASE=/d' \
             -e '/^GRAPH_INDEX_VERSION=/d' \
             -e '/^GRAPH_BOOTSTRAP_ACTIVE_VERSION=/d' \
+            -e '/^GRAPH_EXTRACTION_PRIMARY_PROVIDER=/d' \
+            -e '/^GRAPH_EXTRACTION_FALLBACK_PROVIDER=/d' \
+            -e '/^GRAPH_EXTRACTION_FALLBACK_BASE_URL=/d' \
+            -e '/^GRAPH_EXTRACTION_FALLBACK_MODEL=/d' \
             "$release/.env"
           cat "/tmp/xiaowen-oss-${SOURCE_SHA}.env" >> "$release/.env"
 
@@ -212,6 +354,7 @@ jobs:
             ln -sfn "$previous_release" "$app_root/previous"
           fi
 
+          rollback_armed=true
           ln -sfn "$release" "$app_root/current"
           cd "$app_root/current"
           docker compose -p xiaowen-ai up -d --no-build --remove-orphans
@@ -240,6 +383,10 @@ jobs:
           health_payload=$(curl -fsS http://127.0.0.1:8100/api/health)
           echo "$health_payload" | jq -e \
             '.status == "ok" and .graph.status == "ok" and .queue.status == "ok"' >/dev/null
+
+          deployment_committed=true
+          rollback_armed=false
+          docker image prune -f || true
 
           rm -f \
             "/tmp/xiaowen-ai-${SOURCE_SHA}.tgz" \
