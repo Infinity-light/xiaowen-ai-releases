@@ -352,6 +352,8 @@ jobs:
               docker compose -p xiaowen-ai exec -T postgres \
                 pg_dump -U postgres xiaowen_ai < /dev/null | gzip -1 > "$backup_file"
               test -s "$backup_file"
+              sha256sum "$backup_file" > "$backup_file.sha256"
+              sha256sum --check "$backup_file.sha256"
             fi
             ln -sfn "$previous_release" "$app_root/previous"
           fi
