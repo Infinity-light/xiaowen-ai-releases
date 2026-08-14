@@ -168,10 +168,15 @@ jobs:
             printf 'GRAPH_INDEX_VERSION=graphrag-v3\n'
             printf 'GRAPH_BOOTSTRAP_ACTIVE_VERSION=graphrag-v1\n'
             printf 'GRAPH_RECONCILIATION_RETRY_EPOCH=provider-fallback-20260814\n'
+            printf 'GRAPH_EXTRACTION_CONCURRENCY=1\n'
+            printf 'GRAPH_EXTRACTION_REQUEST_TIMEOUT_MS=120000\n'
+            printf 'GRAPH_EXTRACTION_MAX_TOKENS=4096\n'
             printf 'GRAPH_EXTRACTION_PRIMARY_PROVIDER=deepseek\n'
             printf 'GRAPH_EXTRACTION_FALLBACK_PROVIDER=siliconflow\n'
             printf 'GRAPH_EXTRACTION_FALLBACK_BASE_URL=https://api.siliconflow.cn/v1\n'
-            printf 'GRAPH_EXTRACTION_FALLBACK_MODEL=deepseek-ai/DeepSeek-V4-Flash\n'
+            printf 'GRAPH_EXTRACTION_FALLBACK_MODEL=Qwen/Qwen3-32B\n'
+            printf 'GRAPH_EXTRACTION_SECONDARY_FALLBACK_PROVIDER=siliconflow-secondary\n'
+            printf 'GRAPH_EXTRACTION_SECONDARY_FALLBACK_MODEL=deepseek-ai/DeepSeek-V4-Flash\n'
           } > "$oss_env"
           chmod 600 "$oss_env"
 
@@ -336,10 +341,15 @@ jobs:
             -e '/^GRAPH_INDEX_VERSION=/d' \
             -e '/^GRAPH_BOOTSTRAP_ACTIVE_VERSION=/d' \
             -e '/^GRAPH_RECONCILIATION_RETRY_EPOCH=/d' \
+            -e '/^GRAPH_EXTRACTION_CONCURRENCY=/d' \
+            -e '/^GRAPH_EXTRACTION_REQUEST_TIMEOUT_MS=/d' \
+            -e '/^GRAPH_EXTRACTION_MAX_TOKENS=/d' \
             -e '/^GRAPH_EXTRACTION_PRIMARY_PROVIDER=/d' \
             -e '/^GRAPH_EXTRACTION_FALLBACK_PROVIDER=/d' \
             -e '/^GRAPH_EXTRACTION_FALLBACK_BASE_URL=/d' \
             -e '/^GRAPH_EXTRACTION_FALLBACK_MODEL=/d' \
+            -e '/^GRAPH_EXTRACTION_SECONDARY_FALLBACK_PROVIDER=/d' \
+            -e '/^GRAPH_EXTRACTION_SECONDARY_FALLBACK_MODEL=/d' \
             "$release/.env"
           cat "/tmp/xiaowen-oss-${SOURCE_SHA}.env" >> "$release/.env"
 
