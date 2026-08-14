@@ -46,15 +46,25 @@ jobs:
           set -euo pipefail
           ssh -p "$SERVER_PORT" -i ~/.ssh/deploy_key "$SERVER_USER@$SERVER_HOST" \
             "EXPECTED_SHA='$EXPECTED_SHA' RUN_ID='$RUN_ID' bash -s" <<'REMOTE'
-          set -euo pipefail
+          set -Eeuo pipefail
           app_root=/opt/apps/xiaowen-ai
           cd "$app_root/current"
           evidence_dir="$app_root/runtime-evidence"
           evidence_file="$evidence_dir/graphrag-replica-lock-${RUN_ID}.json"
           mkdir -p "$evidence_dir"
           started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          phase=bootstrap
+          scale_status=-1
+          scale_output='not attempted'
+          same_acquired=-1
+          same_yielded=-1
+          different_acquired=-1
+          released=false
+          new_critical=-1
+          new_deadlocks=-1
+          new_replay_failures=-1
+          open_critical=-1
           current_sha=$(basename "$(readlink -f "$app_root/current")")
-          test "$current_sha" = "$EXPECTED_SHA"
 
           psql_value() {
             docker compose -p xiaowen-ai exec -T postgres \
@@ -62,35 +72,84 @@ jobs:
           }
 
           cleanup() {
-            original_status=$?
-            trap - EXIT
+            original_status=$1
+            trap - EXIT ERR
             set +e
             cd "$app_root/current"
-            docker compose -p xiaowen-ai up -d --no-build --no-recreate --scale backend=1 backend
+            phase_at_exit=$phase
+            before_cleanup=$(for container_id in $(docker compose -p xiaowen-ai ps -a -q backend); do
+              docker inspect "$container_id" --format '{{.Name}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|restart={{.RestartCount}}|exit={{.State.ExitCode}}'
+            done)
+            backend_error_line_count=$(docker compose -p xiaowen-ai logs --no-color --tail 120 backend 2>&1 \
+              | grep -Eic 'error|critical|deadlock|forseti' || true)
+            cleanup_output=$(docker compose -p xiaowen-ai up -d --no-build --no-recreate --no-deps --scale backend=1 backend 2>&1)
+            cleanup_status=$?
             for attempt in $(seq 1 18); do
               remaining=$(docker compose -p xiaowen-ai ps -q backend | wc -l | tr -d ' ')
               health=$(curl -fsS http://127.0.0.1:8100/api/health 2>/dev/null || true)
               if [ "$remaining" = 1 ] && echo "$health" | jq -e \
-                '.status == "ok" and .graph.status == "ok" and .queue.failed == null' >/dev/null 2>&1; then
+                '.status == "ok" and .graph.status == "ok" and .queue.counts.failed == 0' >/dev/null 2>&1; then
                 break
               fi
               sleep 5
             done
             remaining=$(docker compose -p xiaowen-ai ps -q backend | wc -l | tr -d ' ')
-            if [ "$remaining" != 1 ]; then
+            after_cleanup=$(for container_id in $(docker compose -p xiaowen-ai ps -a -q backend); do
+              docker inspect "$container_id" --format '{{.Name}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|restart={{.RestartCount}}|exit={{.State.ExitCode}}'
+            done)
+            if [ "$cleanup_status" != 0 ] || [ "$remaining" != 1 ]; then
               echo "::error::Failed to restore the single-replica baseline"
               original_status=1
             fi
+            finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            result=failure
+            if [ "$original_status" = 0 ] && [ "$phase_at_exit" = completed ]; then
+              result=success
+            fi
+            jq -n \
+              --arg result "$result" \
+              --arg release "$current_sha" \
+              --arg startedAt "$started_at" \
+              --arg finishedAt "$finished_at" \
+              --arg phaseAtExit "$phase_at_exit" \
+              --argjson originalExitCode "$original_status" \
+              --argjson scaleExitCode "$scale_status" \
+              --arg scaleOutput "$scale_output" \
+              --arg containersBeforeCleanup "$before_cleanup" \
+              --argjson backendErrorLineCount "$backend_error_line_count" \
+              --arg cleanupOutput "$cleanup_output" \
+              --argjson cleanupExitCode "$cleanup_status" \
+              --arg containersAfterCleanup "$after_cleanup" \
+              --argjson finalReplicaCount "$remaining" \
+              --argjson replicaCount 2 \
+              --argjson reconciliationCycles 2 \
+              --argjson sameGenerationAcquired "$same_acquired" \
+              --argjson sameGenerationYielded "$same_yielded" \
+              --argjson differentGenerationAcquired "$different_acquired" \
+              --arg released "$released" \
+              --argjson newCritical "$new_critical" \
+              --argjson newDeadlocks "$new_deadlocks" \
+              --argjson newReplayFailures "$new_replay_failures" \
+              --argjson openCritical "$open_critical" \
+              '{result:$result,release:$release,startedAt:$startedAt,finishedAt:$finishedAt,phaseAtExit:$phaseAtExit,originalExitCode:$originalExitCode,scale:{exitCode:$scaleExitCode,output:$scaleOutput},diagnostics:{containersBeforeCleanup:$containersBeforeCleanup,backendErrorLineCount:$backendErrorLineCount,cleanupOutput:$cleanupOutput,cleanupExitCode:$cleanupExitCode,containersAfterCleanup:$containersAfterCleanup,finalReplicaCount:$finalReplicaCount},replicaCount:$replicaCount,reconciliationCycles:$reconciliationCycles,sameGeneration:{acquired:$sameGenerationAcquired,yielded:$sameGenerationYielded},differentGenerations:{acquired:$differentGenerationAcquired},lockReleased:($released == "true"),events:{newCritical:$newCritical,newDeadlocks:$newDeadlocks,newReplayFailures:$newReplayFailures,openCritical:$openCritical}}' \
+              > "$evidence_file"
+            sha256sum "$evidence_file"
+            cat "$evidence_file"
             exit "$original_status"
           }
-          trap cleanup EXIT
+          trap 'cleanup "$?"' EXIT
 
+          phase=verify_release_identity
+          test "$current_sha" = "$EXPECTED_SHA"
+          phase=select_verified_generations
           before_event_id=$(psql_value "SELECT coalesce(max(id),0) FROM graph_reconcile_event;")
           generation_rows=$(psql_value "SELECT enterprise_id || '|' || generation_key FROM graph_generation WHERE graph_version='graphrag-v3' AND status='verified' AND checksum_version=2 ORDER BY expected_entity_count + expected_relation_count DESC, generation_key LIMIT 2;")
           generation_one=$(printf '%s\n' "$generation_rows" | sed -n '1p')
           generation_two=$(printf '%s\n' "$generation_rows" | sed -n '2p')
-          test -n "$generation_one"
-          test -n "$generation_two"
+          if [ -z "$generation_one" ] || [ -z "$generation_two" ]; then
+            echo "::error::Two verified checksum-v2 generations are required"
+            exit 41
+          fi
           enterprise_one=${generation_one%%|*}
           key_one=${generation_one#*|}
           enterprise_two=${generation_two%%|*}
@@ -98,7 +157,16 @@ jobs:
           identity_one="graph-generation-mutation:${enterprise_one}:${key_one}"
           identity_two="graph-generation-mutation:${enterprise_two}:${key_two}"
 
-          docker compose -p xiaowen-ai up -d --no-build --no-recreate --scale backend=2 backend
+          phase=scale_to_two
+          set +e
+          scale_output=$(docker compose -p xiaowen-ai up -d --no-build --no-recreate --no-deps --scale backend=2 backend 2>&1)
+          scale_status=$?
+          set -e
+          if [ "$scale_status" != 0 ]; then
+            echo "::error::Scale-to-two command failed"
+            exit 42
+          fi
+          phase=wait_two_healthy
           for attempt in $(seq 1 24); do
             mapfile -t backend_ids < <(docker compose -p xiaowen-ai ps -q backend)
             healthy=0
@@ -113,11 +181,18 @@ jobs:
             sleep 5
           done
           mapfile -t backend_ids < <(docker compose -p xiaowen-ai ps -q backend)
-          test "${#backend_ids[@]}" = 2
+          if [ "${#backend_ids[@]}" != 2 ]; then
+            echo "::error::Expected two backend containers, found ${#backend_ids[@]}"
+            exit 43
+          fi
           for container_id in "${backend_ids[@]}"; do
-            test "$(docker inspect "$container_id" --format '{{.State.Health.Status}}')" = healthy
+            if [ "$(docker inspect "$container_id" --format '{{.State.Health.Status}}')" != healthy ]; then
+              echo "::error::Backend replica did not become healthy"
+              exit 44
+            fi
           done
 
+          phase=same_generation_lock_probe
           cat > /tmp/graphrag-lock-probe.js <<'NODE'
           const { Client } = require('pg');
           (async () => {
@@ -171,6 +246,7 @@ jobs:
           test "$same_acquired" = 1
           test "$same_yielded" = 1
 
+          phase=different_generation_lock_probe
           docker exec "${backend_ids[0]}" node /tmp/graphrag-lock-probe.js "$identity_one" 5000 > /tmp/different-one.json &
           different_one_pid=$!
           docker exec "${backend_ids[1]}" node /tmp/graphrag-lock-probe.js "$identity_two" 5000 > /tmp/different-two.json &
@@ -184,8 +260,10 @@ jobs:
           test "$released" = true
 
           # Two full reconciliation cycles with both physical replicas online.
+          phase=two_reconciliation_cycles
           sleep 135
 
+          phase=post_cycle_event_gate
           new_critical=$(psql_value "SELECT count(*) FROM graph_reconcile_event WHERE id > ${before_event_id} AND severity='critical';")
           new_deadlocks=$(psql_value "SELECT count(*) FROM graph_reconcile_event WHERE id > ${before_event_id} AND (detail::text ILIKE '%Forseti%' OR detail::text ILIKE '%deadlock%');")
           new_replay_failures=$(psql_value "SELECT count(*) FROM graph_reconcile_event WHERE id > ${before_event_id} AND event_type='generation_ledger_replay_failed';")
@@ -198,28 +276,11 @@ jobs:
           health_payload=$(curl -fsS http://127.0.0.1:8100/api/health)
           echo "$health_payload" | jq -e \
             '.status == "ok" and .graph.status == "ok" and .graphRelease.openCriticalEventCount == 0 and .queue.counts.failed == 0' >/dev/null
-          finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          jq -n \
-            --arg release "$current_sha" \
-            --arg startedAt "$started_at" \
-            --arg finishedAt "$finished_at" \
-            --argjson replicaCount 2 \
-            --argjson reconciliationCycles 2 \
-            --argjson sameGenerationAcquired "$same_acquired" \
-            --argjson sameGenerationYielded "$same_yielded" \
-            --argjson differentGenerationAcquired "$different_acquired" \
-            --arg released "$released" \
-            --argjson newCritical "$new_critical" \
-            --argjson newDeadlocks "$new_deadlocks" \
-            --argjson newReplayFailures "$new_replay_failures" \
-            --argjson openCritical "$open_critical" \
-            '{release:$release,startedAt:$startedAt,finishedAt:$finishedAt,replicaCount:$replicaCount,reconciliationCycles:$reconciliationCycles,sameGeneration:{acquired:$sameGenerationAcquired,yielded:$sameGenerationYielded},differentGenerations:{acquired:$differentGenerationAcquired},lockReleased:($released == "true"),events:{newCritical:$newCritical,newDeadlocks:$newDeadlocks,newReplayFailures:$newReplayFailures,openCritical:$openCritical}}' \
-            > "$evidence_file"
-          sha256sum "$evidence_file"
-          cat "$evidence_file"
+          phase=completed
           REMOTE
 
       - name: Download verification evidence
+        if: always()
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
@@ -232,6 +293,7 @@ jobs:
             graphrag-replica-lock-evidence.json
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: graphrag-replica-lock-${{ github.run_id }}
           path: graphrag-replica-lock-evidence.json
