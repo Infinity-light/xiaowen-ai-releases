@@ -167,6 +167,7 @@ jobs:
             printf 'APP_RELEASE=%s\n' "$SOURCE_SHA"
             printf 'GRAPH_INDEX_VERSION=graphrag-v3\n'
             printf 'GRAPH_BOOTSTRAP_ACTIVE_VERSION=graphrag-v1\n'
+            printf 'GRAPH_RECONCILIATION_RETRY_EPOCH=provider-fallback-20260814\n'
             printf 'GRAPH_EXTRACTION_PRIMARY_PROVIDER=deepseek\n'
             printf 'GRAPH_EXTRACTION_FALLBACK_PROVIDER=siliconflow\n'
             printf 'GRAPH_EXTRACTION_FALLBACK_BASE_URL=https://api.siliconflow.cn/v1\n'
@@ -334,6 +335,7 @@ jobs:
             -e '/^APP_RELEASE=/d' \
             -e '/^GRAPH_INDEX_VERSION=/d' \
             -e '/^GRAPH_BOOTSTRAP_ACTIVE_VERSION=/d' \
+            -e '/^GRAPH_RECONCILIATION_RETRY_EPOCH=/d' \
             -e '/^GRAPH_EXTRACTION_PRIMARY_PROVIDER=/d' \
             -e '/^GRAPH_EXTRACTION_FALLBACK_PROVIDER=/d' \
             -e '/^GRAPH_EXTRACTION_FALLBACK_BASE_URL=/d' \
