@@ -1,0 +1,168 @@
+name: Recover production by activating verified v3
+run-name: "graphrag recover verified v3"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+    steps:
+      - name: Configure production SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Atomically activate verified v3 and recover health
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
+            "$SERVER_USER@$SERVER_HOST" bash -s <<'REMOTE'
+          set -euo pipefail
+          app_root=/opt/apps/xiaowen-ai
+          current_release=$(readlink -f "$app_root/current")
+          cd "$current_release"
+          backend_id=$(docker compose -p xiaowen-ai ps -a -q backend)
+          postgres_id=$(docker compose -p xiaowen-ai ps -a -q postgres)
+          test -n "$backend_id"
+          test -n "$postgres_id"
+          enterprise_id=$(docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+            "SELECT enterprise_id::text FROM graph_release WHERE graph_version='graphrag-v3' LIMIT 1")
+          production_release=$(docker exec "$backend_id" printenv APP_RELEASE)
+          manifest_checksum=$(docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+            "SELECT manifest_checksum FROM graph_release WHERE enterprise_id='$enterprise_id' AND graph_version='graphrag-v3' AND status='ready'")
+          [[ "$enterprise_id" =~ ^[0-9a-f-]{36}$ ]]
+          [[ "$production_release" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$manifest_checksum" =~ ^[0-9a-f]{64}$ ]]
+          gate_runs=$(docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+            "SELECT count(*) FROM (
+               SELECT run_id FROM graph_release_gate_run
+               WHERE enterprise_id='$enterprise_id' AND graph_version='graphrag-v3'
+                 AND manifest_checksum='$manifest_checksum'
+                 AND production_release='$production_release' AND expires_at>now()
+                 AND gate_type=ANY(ARRAY[
+                   'generation_parity','tenant_isolation','evidence_integrity','snapshot_ready',
+                   'neo4j_connectivity','snapshot_failover','restore_drill','rollback_ready',
+                   'fixed_customer_canary','citation_authenticity','performance'
+                 ]::varchar[])
+               GROUP BY run_id
+               HAVING count(DISTINCT gate_type)=11
+                 AND count(DISTINCT gate_type) FILTER (WHERE status='passed')=11
+             ) complete")
+          test "$gate_runs" -ge 1
+          evidence_dir=/tmp/graphrag-production-recover-v3
+          rm -rf "$evidence_dir"
+          mkdir -p "$evidence_dir"
+          docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+            "SELECT jsonb_build_object(
+               'productionRelease','$production_release','enterpriseId','***',
+               'manifestChecksum','$manifest_checksum','completeGateRuns',$gate_runs,
+               'releases',(SELECT jsonb_agg(jsonb_build_object('graphVersion',graph_version,'status',status,'ready',ready_file_count,'expected',expected_file_count) ORDER BY created_at) FROM graph_release WHERE enterprise_id='$enterprise_id'),
+               'generations',(SELECT jsonb_agg(to_jsonb(g) ORDER BY graph_version,status) FROM (SELECT graph_version,status,count(*)::int generation_count,sum(attempt_count)::int attempt_count FROM graph_generation WHERE enterprise_id='$enterprise_id' GROUP BY graph_version,status) g)
+             )" > "$evidence_dir/before.json"
+          docker exec -i "$postgres_id" psql -v ON_ERROR_STOP=1 -U postgres -d xiaowen_ai \
+            > "$evidence_dir/transaction.log" <<SQL
+          BEGIN;
+          SELECT pg_advisory_xact_lock(hashtext('graph-release:$enterprise_id'));
+          DO \$\$
+          DECLARE
+            candidate_ready int;
+            rollback_active int;
+            candidate_generations int;
+            rollback_generations int;
+          BEGIN
+            SELECT count(*) INTO candidate_ready FROM graph_release
+             WHERE enterprise_id='$enterprise_id' AND graph_version='graphrag-v3'
+               AND status='ready' AND expected_file_count=31 AND ready_file_count=31
+               AND manifest_checksum='$manifest_checksum';
+            SELECT count(*) INTO rollback_active FROM graph_release
+             WHERE enterprise_id='$enterprise_id' AND graph_version='graphrag-v3-rollback'
+               AND status='active' AND expected_file_count=31 AND ready_file_count=31;
+            SELECT count(*) INTO candidate_generations FROM graph_generation
+             WHERE enterprise_id='$enterprise_id' AND graph_version='graphrag-v3' AND status='verified';
+            SELECT count(*) INTO rollback_generations FROM graph_generation
+             WHERE enterprise_id='$enterprise_id' AND graph_version='graphrag-v3-rollback' AND status='active';
+            IF candidate_ready<>1 OR rollback_active<>1
+              OR candidate_generations<>31 OR rollback_generations<>31 THEN
+              RAISE EXCEPTION 'v3 recovery precondition failed: release %/%, generations %/%',
+                candidate_ready, rollback_active, candidate_generations, rollback_generations;
+            END IF;
+          END \$\$;
+          UPDATE graph_generation SET status='retired', updated_at=now()
+           WHERE enterprise_id='$enterprise_id' AND status='active' AND graph_version<>'graphrag-v3';
+          UPDATE graph_release SET status='retired', updated_at=now()
+           WHERE enterprise_id='$enterprise_id' AND status='active' AND graph_version<>'graphrag-v3';
+          UPDATE graph_generation SET status='active', checkpoint='complete', updated_at=now()
+           WHERE enterprise_id='$enterprise_id' AND graph_version='graphrag-v3' AND status='verified';
+          UPDATE graph_release SET status='active', activated_at=now(), failure_reason=NULL, updated_at=now()
+           WHERE enterprise_id='$enterprise_id' AND graph_version='graphrag-v3' AND status='ready';
+          UPDATE graph_product_panorama
+           SET status=CASE WHEN graph_version='graphrag-v3' THEN 'active' ELSE 'retired' END, updated_at=now()
+           WHERE enterprise_id='$enterprise_id';
+          UPDATE knowledge_file file
+           SET pipeline_status='available', processing_stage='complete', parse_status='available',
+               parse_error=NULL, graph_status='available', graph_error=NULL,
+               indexed_version=file.source_version, index_version='graphrag-v3', completed_at=now()
+           WHERE file.enterprise_id='$enterprise_id'
+             AND EXISTS (SELECT 1 FROM graph_generation generation
+               WHERE generation.enterprise_id=file.enterprise_id AND generation.file_id=file.id
+                 AND generation.source_version=file.source_version
+                 AND generation.graph_version='graphrag-v3' AND generation.status='active');
+          UPDATE graph_reconcile_event SET repaired=true
+           WHERE enterprise_id IS NULL AND graph_version IS NULL
+             AND event_type='reconcile_cycle_failed' AND repaired=false
+             AND detail->>'error'='duplicate key value violates unique constraint "uq_graph_generation_file_active"';
+          INSERT INTO graph_reconcile_event
+            (enterprise_id, graph_version, severity, event_type, detail, repaired)
+          VALUES ('$enterprise_id','graphrag-v3','info','operator_verified_v3_recovery',
+            jsonb_build_object('productionRelease','$production_release','manifestChecksum','$manifest_checksum','gateRuns',$gate_runs),true);
+          COMMIT;
+          SQL
+          docker compose -p xiaowen-ai up -d --no-build --remove-orphans
+          healthy=false
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            payload=$(curl --silent --show-error http://127.0.0.1:8100/api/health || true)
+            if echo "$payload" | jq -e \
+              '.status=="ok" and .graph.status=="ok" and .queue.status=="ok" and (.graphRelease.activeVersions | any(.graphVersion=="graphrag-v3"))' \
+              >/dev/null 2>&1; then
+              healthy=true
+              printf '%s\n' "$payload" > "$evidence_dir/health.json"
+              break
+            fi
+            sleep 5
+          done
+          test "$healthy" = true
+          docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+            "SELECT jsonb_build_object(
+               'releases',(SELECT jsonb_agg(jsonb_build_object('graphVersion',graph_version,'status',status,'ready',ready_file_count,'expected',expected_file_count) ORDER BY created_at) FROM graph_release WHERE enterprise_id='$enterprise_id'),
+               'generations',(SELECT jsonb_agg(to_jsonb(g) ORDER BY graph_version,status) FROM (SELECT graph_version,status,count(*)::int generation_count,sum(attempt_count)::int attempt_count FROM graph_generation WHERE enterprise_id='$enterprise_id' GROUP BY graph_version,status) g),
+               'openCriticalEvents',(SELECT count(*)::int FROM graph_reconcile_event WHERE severity='critical' AND repaired=false)
+             )" > "$evidence_dir/after.json"
+          tar -czf /tmp/graphrag-production-recover-v3.tgz -C "$evidence_dir" .
+          REMOTE
+          scp -P "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
+            "$SERVER_USER@$SERVER_HOST:/tmp/graphrag-production-recover-v3.tgz" /tmp/graphrag-production-recover-v3.tgz
+          mkdir -p evidence
+          tar -xzf /tmp/graphrag-production-recover-v3.tgz -C evidence
+
+      - name: Upload recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphrag-production-recover-v3-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 30
