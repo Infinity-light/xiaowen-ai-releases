@@ -68,7 +68,7 @@ jobs:
 
           psql_value() {
             docker compose -p xiaowen-ai exec -T postgres \
-              psql -U postgres -d xiaowen_ai -Atc "$1"
+              psql -U postgres -d xiaowen_ai -Atc "$1" < /dev/null
           }
 
           cleanup() {
@@ -105,6 +105,8 @@ jobs:
             result=failure
             if [ "$original_status" = 0 ] && [ "$phase_at_exit" = completed ]; then
               result=success
+            elif [ "$original_status" = 0 ]; then
+              original_status=45
             fi
             jq -n \
               --arg result "$result" \
