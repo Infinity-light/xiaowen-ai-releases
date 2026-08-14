@@ -142,7 +142,7 @@ jobs:
             printf 'NEO4J_PASSWORD=%s\n' "$NEO4J_PASSWORD"
             printf 'NEO4J_DATABASE=neo4j\n'
             printf 'APP_RELEASE=%s\n' "$SOURCE_SHA"
-          printf 'GRAPH_INDEX_VERSION=graphrag-v2\n'
+          printf 'GRAPH_INDEX_VERSION=graphrag-v3\n'
           printf 'GRAPH_BOOTSTRAP_ACTIVE_VERSION=graphrag-v1\n'
           } > "$oss_env"
           chmod 600 "$oss_env"
