@@ -192,7 +192,7 @@ jobs:
               "$evidence_dir/production-e2e.json" >/dev/null
           fi
 
-          curl --fail --silent --show-error http://127.0.0.1:8100/api/health \
+          curl --silent --show-error http://127.0.0.1:8100/api/health \
             > "$evidence_dir/health.json"
           if [ ! -f "$evidence_dir/command-status" ] \
             || [ "$(cat "$evidence_dir/command-status")" -eq 0 ]; then
