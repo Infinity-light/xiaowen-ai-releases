@@ -87,16 +87,23 @@ jobs:
 
           if [ "$MODE" = activate ]; then
             rollback_version="$GRAPH_VERSION-rollback"
-            docker exec "$backend_id" test -f /app/dist/src/graph/prepare-production-rollback-snapshot.js
-            docker exec "$backend_id" node dist/src/graph/prepare-production-rollback-snapshot.js \
-              --enterprise-id "$enterprise_id" \
-              --source-graph-version "$GRAPH_VERSION" \
-              --rollback-graph-version "$rollback_version" \
-              --expected-count "$EXPECTED_COUNT" \
-              > "$evidence_dir/rollback-snapshot.raw.json"
-            tail -n 1 "$evidence_dir/rollback-snapshot.raw.json" | jq \
-              'walk(if type == "object" and has("enterpriseId") then .enterpriseId = "***" else . end)' \
-              > "$evidence_dir/rollback-snapshot.json"
+            active_version=$(docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+              "SELECT graph_version FROM graph_release WHERE enterprise_id='$enterprise_id' AND status='active'")
+            if [ "$active_version" != "$rollback_version" ]; then
+              docker exec "$backend_id" test -f /app/dist/src/graph/prepare-production-rollback-snapshot.js
+              docker exec "$backend_id" node dist/src/graph/prepare-production-rollback-snapshot.js \
+                --enterprise-id "$enterprise_id" \
+                --source-graph-version "$GRAPH_VERSION" \
+                --rollback-graph-version "$rollback_version" \
+                --expected-count "$EXPECTED_COUNT" \
+                > "$evidence_dir/rollback-snapshot.raw.json"
+              tail -n 1 "$evidence_dir/rollback-snapshot.raw.json" | jq \
+                'walk(if type == "object" and has("enterpriseId") then .enterpriseId = "***" else . end)' \
+                > "$evidence_dir/rollback-snapshot.json"
+            else
+              printf '{"passed":true,"skipped":true,"reason":"rollback-snapshot-already-active","activeVersion":"%s"}\n' \
+                "$active_version" > "$evidence_dir/rollback-snapshot.json"
+            fi
             docker exec "$backend_id" test -f /app/dist/src/graph/verify-graph-release.js
             set +e
             docker exec "$backend_id" node dist/src/graph/verify-graph-release.js \
