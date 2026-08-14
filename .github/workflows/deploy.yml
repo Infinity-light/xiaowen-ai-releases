@@ -141,7 +141,9 @@ jobs:
             printf 'NEO4J_USER=neo4j\n'
             printf 'NEO4J_PASSWORD=%s\n' "$NEO4J_PASSWORD"
             printf 'NEO4J_DATABASE=neo4j\n'
-            printf 'GRAPH_INDEX_VERSION=graphrag-v1\n'
+            printf 'APP_RELEASE=%s\n' "$SOURCE_SHA"
+          printf 'GRAPH_INDEX_VERSION=graphrag-v2\n'
+          printf 'GRAPH_BOOTSTRAP_ACTIVE_VERSION=graphrag-v1\n'
           } > "$oss_env"
           chmod 600 "$oss_env"
 
@@ -183,7 +185,9 @@ jobs:
             -e '/^NEO4J_USER=/d' \
             -e '/^NEO4J_PASSWORD=/d' \
             -e '/^NEO4J_DATABASE=/d' \
+            -e '/^APP_RELEASE=/d' \
             -e '/^GRAPH_INDEX_VERSION=/d' \
+            -e '/^GRAPH_BOOTSTRAP_ACTIVE_VERSION=/d' \
             "$release/.env"
           cat "/tmp/xiaowen-oss-${SOURCE_SHA}.env" >> "$release/.env"
 
