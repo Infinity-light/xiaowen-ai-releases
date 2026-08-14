@@ -1,0 +1,148 @@
+name: Finalize production GraphRAG
+run-name: "graphrag ${{ inputs.mode }} ${{ inputs.graph_version }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Operation to run against the deployed production release
+        required: true
+        type: choice
+        options:
+          - activate
+          - finalize
+      source_sha:
+        description: Exact deployed private-source commit
+        required: true
+      graph_version:
+        description: Candidate or active graph version
+        required: true
+        default: graphrag-v3
+      expected_generation_count:
+        description: Exact completed generation count for the idempotency probe
+        required: true
+        default: "31"
+      request_id:
+        description: Production E2E request id (required only for finalize)
+        required: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Configure production SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Run production GraphRAG verification
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          MODE: ${{ inputs.mode }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          GRAPH_VERSION: ${{ inputs.graph_version }}
+          EXPECTED_COUNT: ${{ inputs.expected_generation_count }}
+          REQUEST_ID: ${{ inputs.request_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GRAPH_VERSION" =~ ^[a-z0-9._-]{3,80}$ ]]
+          [[ "$EXPECTED_COUNT" =~ ^[0-9]+$ ]]
+          if [ "$MODE" = finalize ]; then
+            [[ "$REQUEST_ID" =~ ^graphrag-production-[0-9]+$ ]]
+          fi
+          ssh -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
+            "$SERVER_USER@$SERVER_HOST" \
+            "MODE='$MODE' SOURCE_SHA='$SOURCE_SHA' GRAPH_VERSION='$GRAPH_VERSION' EXPECTED_COUNT='$EXPECTED_COUNT' REQUEST_ID='$REQUEST_ID' bash -s" <<'REMOTE'
+          set -euo pipefail
+          app_root=/opt/apps/xiaowen-ai
+          current_release=$(readlink -f "$app_root/current")
+          test "$(basename "$current_release")" = "$SOURCE_SHA"
+          cd "$current_release"
+          backend_id=$(docker compose -p xiaowen-ai ps -q backend)
+          postgres_id=$(docker compose -p xiaowen-ai ps -q postgres)
+          test -n "$backend_id"
+          test -n "$postgres_id"
+          test "$(docker inspect "$backend_id" --format '{{.State.Health.Status}}')" = healthy
+          test "$(docker inspect "$backend_id" --format '{{.RestartCount}}')" = 0
+          enterprise_id=$(docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+            "SELECT enterprise_id::text FROM graph_release WHERE graph_version='$GRAPH_VERSION' AND status IN ('ready','active') ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END, updated_at DESC LIMIT 1")
+          [[ "$enterprise_id" =~ ^[0-9a-f-]{36}$ ]]
+          evidence_dir="/tmp/graphrag-production-$MODE"
+          rm -rf "$evidence_dir"
+          mkdir -p "$evidence_dir"
+          question='我遇到扎松梅朵客户，我跟他有哪些合作机会'
+          question_b64=$(printf '%s' "$question" | base64 -w0)
+
+          if [ "$MODE" = activate ]; then
+            docker exec "$backend_id" test -f /app/dist/src/graph/verify-graph-release.js
+            docker exec "$backend_id" node dist/src/graph/verify-graph-release.js \
+              --enterprise-id "$enterprise_id" \
+              --graph-version "$GRAPH_VERSION" \
+              --question-base64 "$question_b64" \
+              --role admin \
+              --performance-limit-ms 120000 \
+              > "$evidence_dir/release-gates.raw.json"
+            tail -n 1 "$evidence_dir/release-gates.raw.json" | jq \
+              'walk(if type == "object" and has("enterpriseId") then .enterpriseId = "***" else . end)' \
+              > "$evidence_dir/release-gates.json"
+
+            docker exec "$backend_id" test -f /app/dist/src/graph/verify-generation-idempotency.js
+            docker exec "$backend_id" node dist/src/graph/verify-generation-idempotency.js \
+              --enterprise-id "$enterprise_id" \
+              --graph-version "$GRAPH_VERSION" \
+              --expected-count "$EXPECTED_COUNT" \
+              > "$evidence_dir/generation-idempotency.raw.json"
+            tail -n 1 "$evidence_dir/generation-idempotency.raw.json" | jq \
+              'walk(if type == "object" and has("enterpriseId") then .enterpriseId = "***" else . end)' \
+              > "$evidence_dir/generation-idempotency.json"
+            jq -e '.passed == true and .generationCount == 31 and .extractionModelCalls == 0 and .embeddingModelCalls == 0 and .attemptCount.delta == 0' \
+              "$evidence_dir/generation-idempotency.json" >/dev/null
+          else
+            docker exec "$backend_id" test -f /app/dist/src/graph/finalize-production-canary.js
+            docker exec "$backend_id" node dist/src/graph/finalize-production-canary.js \
+              --enterprise-id "$enterprise_id" \
+              --graph-version "$GRAPH_VERSION" \
+              --request-id "$REQUEST_ID" \
+              --question-base64 "$question_b64" \
+              > "$evidence_dir/production-e2e.raw.json"
+            tail -n 1 "$evidence_dir/production-e2e.raw.json" | jq \
+              'walk(if type == "object" and has("enterpriseId") then .enterpriseId = "***" else . end)' \
+              > "$evidence_dir/production-e2e.json"
+            jq -e '.cleanup.conversationDeleted == true and .gateStatus.ready == true' \
+              "$evidence_dir/production-e2e.json" >/dev/null
+          fi
+
+          curl --fail --silent --show-error http://127.0.0.1:8100/api/health \
+            > "$evidence_dir/health.json"
+          jq -e --arg version "$GRAPH_VERSION" \
+            '.status == "ok" and .graph.status == "ok" and (.graphRelease.activeVersions | any(.graphVersion == $version))' \
+            "$evidence_dir/health.json" >/dev/null
+          tar -czf "/tmp/graphrag-production-$MODE.tgz" -C "$evidence_dir" .
+          REMOTE
+
+          scp -P "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
+            "$SERVER_USER@$SERVER_HOST:/tmp/graphrag-production-$MODE.tgz" \
+            "/tmp/graphrag-production-$MODE.tgz"
+          mkdir -p evidence
+          tar -xzf "/tmp/graphrag-production-$MODE.tgz" -C evidence
+
+      - name: Upload production evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphrag-production-${{ inputs.mode }}-${{ github.run_id }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 30
