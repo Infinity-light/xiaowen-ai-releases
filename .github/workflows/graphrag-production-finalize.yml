@@ -97,7 +97,7 @@ jobs:
             tail -n 1 "$evidence_dir/rollback-snapshot.raw.json" | jq \
               'walk(if type == "object" and has("enterpriseId") then .enterpriseId = "***" else . end)' \
               > "$evidence_dir/rollback-snapshot.json"
-            jq -e '.passed == true and .generationCount == 31 and .modelCalls == 0' \
+            jq -e '.passed == true and ((.skipped == true and .reason == "rollback-snapshot-already-active") or (.generationCount == 31 and .modelCalls == 0))' \
               "$evidence_dir/rollback-snapshot.json" >/dev/null
             docker exec "$backend_id" test -f /app/dist/src/graph/verify-graph-release.js
             set +e
