@@ -99,29 +99,6 @@ jobs:
               > "$evidence_dir/rollback-snapshot.json"
             jq -e '.passed == true and ((.skipped == true and .reason == "rollback-snapshot-already-active") or (.generationCount == 31 and .modelCalls == 0))' \
               "$evidence_dir/rollback-snapshot.json" >/dev/null
-            docker exec \
-              -e GRAPH_RELEASE_ENTERPRISE_ID="$enterprise_id" \
-              -e GRAPH_RELEASE_VERSION="$GRAPH_VERSION" \
-              "$backend_id" node -e '
-                const { NestFactory } = require("@nestjs/core");
-                const { AppModule } = require("./dist/src/app.module");
-                const { GraphLedgerService } = require("./dist/src/graph/graph-ledger.service");
-                (async () => {
-                  const app = await NestFactory.createApplicationContext(AppModule, { logger: ["error", "warn"] });
-                  try {
-                    const ledger = app.get(GraphLedgerService);
-                    await ledger.maybeActivateRelease(process.env.GRAPH_RELEASE_ENTERPRISE_ID, process.env.GRAPH_RELEASE_VERSION);
-                    await ledger.maybeActivateRelease(process.env.GRAPH_RELEASE_ENTERPRISE_ID, process.env.GRAPH_RELEASE_VERSION);
-                    process.stdout.write(JSON.stringify({
-                      graphVersion: process.env.GRAPH_RELEASE_VERSION,
-                      snapshot: await ledger.snapshotHealth(
-                        process.env.GRAPH_RELEASE_ENTERPRISE_ID,
-                        process.env.GRAPH_RELEASE_VERSION,
-                      ),
-                    }) + "\n");
-                  } finally { await app.close(); }
-                })().catch((error) => { console.error(error); process.exit(1); });
-              ' > "$evidence_dir/candidate-normalization.json"
             docker exec "$backend_id" test -f /app/dist/src/graph/verify-graph-release.js
             set +e
             docker exec "$backend_id" node dist/src/graph/verify-graph-release.js \
