@@ -85,17 +85,27 @@ jobs:
           question_b64='5oiR6YGH5Yiw5omO5p2+5qKF5py15a6i5oi377yM5oiR6Lef5LuW5pyJ5ZOq5Lqb5ZCI5L2c5py65Lya'
 
           if [ "$MODE" = activate ]; then
-            rollback_version="$GRAPH_VERSION-rollback"
-            docker exec "$backend_id" test -f /app/dist/src/graph/prepare-production-rollback-snapshot.js
-            docker exec "$backend_id" node dist/src/graph/prepare-production-rollback-snapshot.js \
-              --enterprise-id "$enterprise_id" \
-              --source-graph-version "$GRAPH_VERSION" \
-              --rollback-graph-version "$rollback_version" \
-              --expected-count "$EXPECTED_COUNT" \
-              > "$evidence_dir/rollback-snapshot.raw.json"
-            tail -n 1 "$evidence_dir/rollback-snapshot.raw.json" | jq \
-              'walk(if type == "object" and has("enterpriseId") then .enterpriseId = "***" else . end)' \
+            # A blue-green candidate must be verified while the previously active,
+            # independently validated graph remains the real rollback source. Cloning the
+            # unverified candidate and activating that clone would silently retire the known-good graph.
+            docker exec "$postgres_id" psql -U postgres -d xiaowen_ai -Atc \
+              "SELECT jsonb_build_object(
+                 'passed', graph_version<>'$GRAPH_VERSION'
+                   AND expected_file_count=$EXPECTED_COUNT
+                   AND ready_file_count=$EXPECTED_COUNT
+                   AND verified_at IS NOT NULL,
+                 'activeVersion', graph_version,
+                 'candidateVersion', '$GRAPH_VERSION',
+                 'expectedFileCount', expected_file_count,
+                 'readyFileCount', ready_file_count,
+                 'verifiedAt', verified_at
+               )
+               FROM graph_release
+               WHERE enterprise_id='$enterprise_id' AND status='active'
+               ORDER BY activated_at DESC LIMIT 1" \
               > "$evidence_dir/rollback-snapshot.json"
+            jq -e '.passed == true and .activeVersion != .candidateVersion' \
+              "$evidence_dir/rollback-snapshot.json" >/dev/null
             docker exec "$backend_id" test -f /app/dist/src/graph/verify-graph-release.js
             set +e
             docker exec "$backend_id" node dist/src/graph/verify-graph-release.js \

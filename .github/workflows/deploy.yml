@@ -151,6 +151,10 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
 
+          graph_index_version=$(jq -er '.envVars.GRAPH_INDEX_VERSION | select(type == "string" and test("^[a-zA-Z0-9._-]{3,80}$"))' .deploy/config.json)
+          graph_bootstrap_version=$(jq -er '.envVars.GRAPH_BOOTSTRAP_ACTIVE_VERSION | select(type == "string" and test("^[a-zA-Z0-9._-]{3,80}$"))' .deploy/config.json)
+          graph_retry_epoch=$(jq -er '.envVars.GRAPH_RECONCILIATION_RETRY_EPOCH | select(type == "string" and test("^[a-zA-Z0-9._-]{1,160}$"))' .deploy/config.json)
+
           oss_env="/tmp/xiaowen-oss-${SOURCE_SHA}.env"
           {
             printf 'XIAOWEN_OSS_ACCESS_KEY_ID=%s\n' "$XIAOWEN_OSS_ACCESS_KEY_ID"
@@ -166,9 +170,9 @@ jobs:
             printf 'NEO4J_PASSWORD=%s\n' "$NEO4J_PASSWORD"
             printf 'NEO4J_DATABASE=neo4j\n'
             printf 'APP_RELEASE=%s\n' "$SOURCE_SHA"
-            printf 'GRAPH_INDEX_VERSION=graphrag-v3\n'
-            printf 'GRAPH_BOOTSTRAP_ACTIVE_VERSION=graphrag-v1\n'
-            printf 'GRAPH_RECONCILIATION_RETRY_EPOCH=provider-fallback-qwen25-first-20260814\n'
+            printf 'GRAPH_INDEX_VERSION=%s\n' "$graph_index_version"
+            printf 'GRAPH_BOOTSTRAP_ACTIVE_VERSION=%s\n' "$graph_bootstrap_version"
+            printf 'GRAPH_RECONCILIATION_RETRY_EPOCH=%s\n' "$graph_retry_epoch"
             printf 'GRAPH_EXTRACTION_CONCURRENCY=1\n'
             printf 'GRAPH_EXTRACTION_REQUEST_TIMEOUT_MS=120000\n'
             printf 'GRAPH_EXTRACTION_MAX_TOKENS=3072\n'
